@@ -1,9 +1,29 @@
 {
   "properties": [
     {
-      "name": "jwt.secret",
+      "name": "app.auth.jwt.secret",
       "type": "java.lang.String",
       "description": "The secret key used for signing JWT tokens."
+    },
+    {
+      "name": "app.auth.jwt.expiration",
+      "type": "java.lang.Long",
+      "description": "The expiration time for JWT tokens in milliseconds."
+    },
+    {
+      "name": "app.auth.cookie.name",
+      "type": "java.lang.String",
+      "description": "The name of the authentication cookie."
+    },
+    {
+      "name": "app.auth.cookie.secure",
+      "type": "java.lang.Boolean",
+      "description": "Whether the authentication cookie should be marked as secure."
+    },
+    {
+      "name": "app.auth.cookie.same-site",
+      "type": "java.lang.String",
+      "description": "The SameSite attribute for the authentication cookie (e.g., Lax, Strict, None)."
     }
   ]
 }

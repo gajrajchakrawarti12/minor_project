@@ -9,6 +9,7 @@
     "skipLibCheck": true,
 
     /* Bundler mode */
+    "baseUrl": ".",
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
@@ -22,7 +23,11 @@
     "noUnusedParameters": true,
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedSideEffectImports": true
+    "noUncheckedSideEffectImports": true,
+
+    "paths": {
+      "@/*": ["src/*"]
+    }
   },
   "include": ["src"]
 }

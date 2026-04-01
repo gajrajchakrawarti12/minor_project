@@ -20,8 +20,11 @@ import io.jsonwebtoken.security.Keys;
 public class JWTService {
 
     // Secret key for signing the JWT
-    @Value("${jwt.secret}")
+    @Value("${app.auth.jwt.secret}")
     private String SECRET_KEY;
+
+    @Value("${app.auth.jwt.expiration:900000}") // Default to 15 minutes if not set
+    private long jwtExpirationMs;
     
     // Method to get the signing key
     private Key getKey() {
@@ -37,7 +40,7 @@ public class JWTService {
                 .add(claims)
                 .subject(username)
                 .issuedAt(new Date(System.currentTimeMillis()))
-                .expiration(new Date(System.currentTimeMillis() + 1000 * 60))
+                .expiration(new Date(System.currentTimeMillis() + jwtExpirationMs))
                 .and()
                 .signWith(getKey())
                 .compact();

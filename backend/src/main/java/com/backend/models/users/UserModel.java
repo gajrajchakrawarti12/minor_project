@@ -19,10 +19,12 @@ import lombok.Setter;
 class UserRequestModel implements UserDetails{
     private String username;
     private String password;
+    private String role;
 
     @Override
     public Collection<? extends GrantedAuthority> getAuthorities() {
-        return Collections.singleton(new SimpleGrantedAuthority("USER"));
+        UserRole resolvedRole = UserRole.fromInput(role);
+        return Collections.singleton(new SimpleGrantedAuthority(resolvedRole.toAuthority()));
     }
 }
 
@@ -32,4 +34,5 @@ class UserRequestModel implements UserDetails{
 @Setter
 class UserResponseModel {
     private String username;
+    private String role;
 }
