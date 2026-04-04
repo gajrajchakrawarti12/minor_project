@@ -1,40 +1,30 @@
-import { useEffect, useState } from 'react';
-import { Routes, Route, useNavigate } from 'react-router-dom'
+import { Routes, Route, Outlet } from 'react-router-dom'
 import Login from '@/features/auth/pages/login';
 import Signup from '@/features/auth/pages/signup';
 import ProtectedRoutes from '@/config/protectedRoutes';
-import { authContext, type AuthUser } from '@/features/auth/authContext';
+import Home from '@/features/home';
+import gradientBackgroundDark from "@/assets/images/gradient-background-dark.png";
+import gradientBackgroundLight from "@/assets/images/gradient-background-light.png";
+import Header from "@/shared/components/header";
+import Departments from '@/features/departments';
+import Subjects from '@/features/subject/index';
+import TimeTable from '@/features/timetable';
 
-function Home() {
-  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
-  const navigate = useNavigate();
-
-  useEffect(() => {
-    const loadCurrentUser = async () => {
-      const user = await authContext.getCurrentUser();
-      setCurrentUser(user);
-    };
-
-    void loadCurrentUser();
-  }, []);
-
-  const handleLogout = async () => {
-    await authContext.logout();
-    navigate('/login', { replace: true });
-  };
+function ProtectedLayout() {
+  const isDarkMode = typeof document !== "undefined" && document.documentElement.classList.contains("dark");
 
   return (
-    <div>
-      <h1>Home</h1>
-      <p>Logged in as: {currentUser?.username ?? 'Unknown user'}</p>
-      <p>Roles: {currentUser?.roles?.join(', ') ?? 'No roles'}</p>
-      <button type="button" onClick={handleLogout}>Logout</button>
+    <div className="min-h-screen flex flex-wrap items-center justify-center p-4"
+      style={{
+        backgroundImage: `url(${isDarkMode ? gradientBackgroundDark : gradientBackgroundLight})`,
+        backgroundSize: "cover",
+        backgroundPosition: "center", 
+        backgroundRepeat: "no-repeat",
+      }}>
+      <Header />
+      <Outlet />
     </div>
-  );
-}
-
-function About() {
-  return <h1>About</h1>
+  )
 }
 
 function AppRoutes() {
@@ -43,11 +33,16 @@ function AppRoutes() {
       <Route path="/login" element={<Login />} />
       <Route path="/signup" element={<Signup />} />
       <Route element={<ProtectedRoutes />}>
-        <Route path="/" element={<Home />} />
-        <Route path="/about" element={<About />} />
+        <Route element={<ProtectedLayout />}>
+            <Route path="/" element={<Home />} />
+            <Route path="/departments" element={<Departments />} />
+            <Route path="/subjects" element={<Subjects />} />
+            <Route path="/timetable" element={<TimeTable />} />
+        </Route>
       </Route>
       <Route path="*" element={<h1>404 Not Found</h1>} />
     </Routes>
+
   )
 }
 
