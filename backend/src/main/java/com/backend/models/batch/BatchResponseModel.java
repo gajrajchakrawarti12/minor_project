@@ -1,5 +1,7 @@
 package com.backend.models.batch;
 
+import java.util.Set;
+
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 import lombok.AllArgsConstructor;
@@ -21,4 +23,7 @@ public class BatchResponseModel {
 
     @JsonProperty("department_id")
     private Long departmentId;
+
+    @JsonProperty("subject_ids")
+    private Set<Long> subjectIds;
 }

@@ -24,6 +24,8 @@ function Header() {
                         <Link to="/" className="hover:text-gray-700">Home</Link>
                         <Link to="/departments" className="hover:text-gray-700">Departments</Link>
                         <Link to="/subjects" className="hover:text-gray-700">Subjects</Link>
+                        <Link to="/rooms" className="hover:text-gray-700">Rooms</Link>
+                        <Link to="/timeslots" className="hover:text-gray-700">Time Slots</Link>
                         <Link to="/timetable" className="hover:text-gray-700">TimeTable</Link>
                     </div>
                     <div className="flex items-center space-x-4">

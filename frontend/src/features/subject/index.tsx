@@ -7,6 +7,7 @@ import { Alert, AlertDescription } from "@/shared/components/ui/alert";
 import { Button } from "@/shared/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/shared/components/ui/card";
 import { Input } from "@/shared/components/ui/input";
+import { listDepartments, type Department } from "@/features/departments/departmentApi";
 import {
   createSubject,
   deleteSubject,
@@ -18,6 +19,7 @@ import {
 
 type SubjectFormState = {
   name: string;
+  departmentIds: string[];
   lecture: string;
   tutorial: string;
   practical: string;
@@ -25,6 +27,7 @@ type SubjectFormState = {
 
 const initialFormState: SubjectFormState = {
   name: "",
+  departmentIds: [],
   lecture: "",
   tutorial: "",
   practical: "",
@@ -42,6 +45,7 @@ const resolveErrorMessage = (error: unknown): string => {
 
 function Subjects() {
   const [subjects, setSubjects] = useState<Subject[]>([]);
+  const [departments, setDepartments] = useState<Department[]>([]);
   const [selectedSubjectId, setSelectedSubjectId] = useState<number | null>(null);
   const [formState, setFormState] = useState<SubjectFormState>(initialFormState);
 
@@ -60,8 +64,12 @@ function Subjects() {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await listSubjects();
-      setSubjects(response);
+      const [subjectResponse, departmentResponse] = await Promise.all([
+        listSubjects(),
+        listDepartments(),
+      ]);
+      setSubjects(subjectResponse);
+      setDepartments(departmentResponse);
     } catch (err) {
       setError(resolveErrorMessage(err));
     } finally {
@@ -84,6 +92,7 @@ function Subjects() {
     setSelectedSubjectId(subject.id);
     setFormState({
       name: subject.name,
+      departmentIds: subject.department_ids.map(String),
       lecture: String(subject.lecture),
       tutorial: String(subject.tutorial),
       practical: String(subject.practical),
@@ -104,12 +113,19 @@ function Subjects() {
   };
 
   const buildPayload = (): SubjectPayload | null => {
+    const departmentIds = formState.departmentIds
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0);
     const lecture = parseHours(formState.lecture);
     const tutorial = parseHours(formState.tutorial);
     const practical = parseHours(formState.practical);
 
     if (!formState.name.trim()) {
       setError("Subject name is required.");
+      return null;
+    }
+    if (departmentIds.length === 0) {
+      setError("Please select at least one department.");
       return null;
     }
     if (lecture === null) {
@@ -127,6 +143,7 @@ function Subjects() {
 
     return {
       name: formState.name.trim(),
+      department_ids: departmentIds,
       lecture,
       tutorial,
       practical,
@@ -238,6 +255,10 @@ function Subjects() {
                     >
                       <div className="font-semibold text-foreground">{subject.name}</div>
                       <div className="text-xs text-muted-foreground">
+                        Dept: {subject.department_ids
+                          .map((id) => departments.find((department) => department.id === id)?.abbreviation)
+                          .filter(Boolean)
+                          .join(", ") || "-"} | {" "}
                         L: {subject.lecture} | T: {subject.tutorial} | P: {subject.practical}
                       </div>
                     </button>
@@ -263,6 +284,28 @@ function Subjects() {
                       onChange={(e) => setFormState((current) => ({ ...current, name: e.target.value }))}
                       required
                     />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-foreground">Department</label>
+                    <select
+                      name="departmentIds"
+                      multiple
+                      value={formState.departmentIds}
+                      onChange={(e) => {
+                        const selected = Array.from(e.target.selectedOptions).map((option) => option.value);
+                        setFormState((current) => ({ ...current, departmentIds: selected }));
+                      }}
+                      className="min-h-28 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                      required
+                    >
+                      {departments.map((department) => (
+                        <option key={department.id} value={department.id}>
+                          {department.name} ({department.abbreviation})
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-muted-foreground">Hold Ctrl/Cmd to select multiple departments.</p>
                   </div>
 
                   <div className="grid gap-4 sm:grid-cols-3">

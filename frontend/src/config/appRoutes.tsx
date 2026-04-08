@@ -8,7 +8,9 @@ import gradientBackgroundLight from "@/assets/images/gradient-background-light.p
 import Header from "@/shared/components/header";
 import Departments from '@/features/departments';
 import Subjects from '@/features/subject/index';
+import Rooms from '@/features/room';
 import TimeTable from '@/features/timetable';
+import TimeSlotPage from '@/features/timeslot';
 
 function ProtectedLayout() {
   const isDarkMode = typeof document !== "undefined" && document.documentElement.classList.contains("dark");
@@ -37,6 +39,8 @@ function AppRoutes() {
             <Route path="/" element={<Home />} />
             <Route path="/departments" element={<Departments />} />
             <Route path="/subjects" element={<Subjects />} />
+            <Route path="/rooms" element={<Rooms />} />
+            <Route path="/timeslots" element={<TimeSlotPage />} />
             <Route path="/timetable" element={<TimeTable />} />
         </Route>
       </Route>

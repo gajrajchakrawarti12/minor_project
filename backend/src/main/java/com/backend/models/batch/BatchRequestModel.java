@@ -1,5 +1,7 @@
 package com.backend.models.batch;
 
+import java.util.Set;
+
 import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
@@ -30,4 +32,8 @@ public class BatchRequestModel {
     @JsonProperty("department_id")
     @JsonAlias("departmentId")
     private Long departmentId;
+
+    @JsonProperty("subject_ids")
+    @JsonAlias("subjectIds")
+    private Set<Long> subjectIds;
 }

@@ -1,6 +1,10 @@
 package com.backend.models.batch;
 
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -10,6 +14,8 @@ import com.backend.exceptions.DuplicateResourceException;
 import com.backend.exceptions.ResourceNotFoundException;
 import com.backend.models.department.DepartmentEntity;
 import com.backend.models.department.DepartmentRepository;
+import com.backend.models.subject.SubjectEntity;
+import com.backend.models.subject.SubjectRepository;
 
 @Service
 public class BatchService {
@@ -19,6 +25,9 @@ public class BatchService {
 
     @Autowired
     private DepartmentRepository departmentRepository;
+
+    @Autowired
+    private SubjectRepository subjectRepository;
 
     public List<BatchResponseModel> getAllBatches() {
         return batchRepository.findAll().stream().map(this::toResponse).toList();
@@ -32,6 +41,7 @@ public class BatchService {
 
     public BatchResponseModel createBatch(BatchRequestModel request) {
         DepartmentEntity department = getDepartmentOrThrow(request.getDepartmentId());
+        Set<SubjectEntity> subjects = getSubjectsByIdsOrThrow(request.getSubjectIds(), "subject_ids");
         String normalizedName = normalize(request.getName());
 
         validateUniqueBatch(normalizedName, request.getSemester(), department.getId(), null);
@@ -40,6 +50,7 @@ public class BatchService {
         entity.setName(normalizedName);
         entity.setSemester(request.getSemester());
         entity.setDepartment(department);
+        entity.setSubject(subjects);
 
         try {
             BatchEntity saved = batchRepository.save(entity);
@@ -55,6 +66,7 @@ public class BatchService {
                 .orElseThrow(() -> new ResourceNotFoundException("Batch not found with id: " + id));
 
         DepartmentEntity department = getDepartmentOrThrow(request.getDepartmentId());
+        Set<SubjectEntity> subjects = getSubjectsByIdsOrThrow(request.getSubjectIds(), "subject_ids");
         String normalizedName = normalize(request.getName());
 
         validateUniqueBatch(normalizedName, request.getSemester(), department.getId(), id);
@@ -62,6 +74,7 @@ public class BatchService {
         existing.setName(normalizedName);
         existing.setSemester(request.getSemester());
         existing.setDepartment(department);
+        existing.setSubject(subjects);
 
         try {
             BatchEntity saved = batchRepository.save(existing);
@@ -94,6 +107,21 @@ public class BatchService {
         });
     }
 
+    private Set<SubjectEntity> getSubjectsByIdsOrThrow(Set<Long> subjectIds, String fieldName) {
+        Set<Long> requested = subjectIds == null ? Collections.emptySet() : new HashSet<>(subjectIds);
+        if (requested.isEmpty()) {
+            return new HashSet<>();
+        }
+
+        List<SubjectEntity> subjects = subjectRepository.findAllById(requested);
+        if (subjects.size() != requested.size()) {
+            Set<Long> foundIds = subjects.stream().map(SubjectEntity::getId).collect(Collectors.toSet());
+            Set<Long> missingIds = requested.stream().filter(id -> !foundIds.contains(id)).collect(Collectors.toSet());
+            throw new ResourceNotFoundException("Invalid " + fieldName + ", subject ids not found: " + missingIds);
+        }
+        return new HashSet<>(subjects);
+    }
+
     private String normalize(String value) {
         return value == null ? null : value.trim();
     }
@@ -103,6 +131,7 @@ public class BatchService {
                 entity.getId(),
                 entity.getName(),
                 entity.getSemester(),
-                entity.getDepartment().getId());
+                entity.getDepartment().getId(),
+                entity.getSubject().stream().map(SubjectEntity::getId).collect(Collectors.toSet()));
     }
 }

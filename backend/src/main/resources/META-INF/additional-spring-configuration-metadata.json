@@ -24,6 +24,11 @@
       "name": "app.auth.cookie.same-site",
       "type": "java.lang.String",
       "description": "The SameSite attribute for the authentication cookie (e.g., Lax, Strict, None)."
+    },
+    {
+      "name": "app.timetable.max-generation-ms",
+      "type": "java.lang.Long",
+      "description": "The maximum time allowed for timetable generation in milliseconds. If the generation process exceeds this time, it will be terminated to prevent resource exhaustion."
     }
   ]
 }

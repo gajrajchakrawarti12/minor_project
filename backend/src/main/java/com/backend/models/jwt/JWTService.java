@@ -23,7 +23,7 @@ public class JWTService {
     @Value("${app.auth.jwt.secret}")
     private String SECRET_KEY;
 
-    @Value("${app.auth.jwt.expiration:900000}") // Default to 15 minutes if not set
+    @Value("${app.auth.jwt.expiration:86400000}") // Default to 24 hours if not set
     private long jwtExpirationMs;
     
     // Method to get the signing key

@@ -33,6 +33,7 @@ type TeacherFormState = {
 type BatchFormState = {
     name: string;
     semester: string;
+    subjectIds: number[];
 };
 
 const initialTeacherFormState: TeacherFormState = {
@@ -49,6 +50,7 @@ const initialFormState: FormState = {
 const initialBatchFormState: BatchFormState = {
     name: "",
     semester: "",
+    subjectIds: [],
 };
 
 const resolveErrorMessage = (error: unknown): string => {
@@ -184,6 +186,13 @@ function Departments() {
         [teacherFormState.specializationIds, subjectNameById]
     );
 
+    const selectedBatchSubjectNames = useMemo(
+        () => batchFormState.subjectIds
+            .map((id) => subjectNameById.get(id))
+            .filter((name): name is string => Boolean(name)),
+        [batchFormState.subjectIds, subjectNameById]
+    );
+
     const loadTeachers = useCallback(async () => {
         setIsLoadingTeachers(true);
         setError(null);
@@ -256,6 +265,7 @@ function Departments() {
         setBatchFormState({
             name: batch.name,
             semester: String(batch.semester),
+            subjectIds: batch.subject_ids,
         });
     }, [batches, selectedBatchId]);
 
@@ -429,6 +439,11 @@ function Departments() {
             return false;
         }
 
+        if (batchFormState.subjectIds.some((subjectId) => !Number.isInteger(subjectId) || subjectId <= 0)) {
+            setError("Selected subjects are invalid.");
+            return false;
+        }
+
         return true;
     };
 
@@ -572,6 +587,7 @@ function Departments() {
         setBatchFormState({
             name: batch.name,
             semester: String(batch.semester),
+            subjectIds: batch.subject_ids,
         });
         setIsEditingBatch(true);
         setError(null);
@@ -591,6 +607,7 @@ function Departments() {
             name: batchFormState.name.trim(),
             semester: Number(batchFormState.semester),
             department_id: Number(selectedDepartment?.id),
+            subject_ids: batchFormState.subjectIds,
         };
 
         setIsSavingBatch(true);
@@ -602,6 +619,7 @@ function Departments() {
                 setBatchFormState({
                     name: updated.name,
                     semester: String(updated.semester),
+                    subjectIds: updated.subject_ids,
                 });
             } else {
                 const created = await createBatch(payload);
@@ -611,6 +629,7 @@ function Departments() {
                 setBatchFormState({
                     name: created.name,
                     semester: String(created.semester),
+                    subjectIds: created.subject_ids,
                 });
                 setSuccessMessage("Batch created successfully.");
             }
@@ -1041,6 +1060,19 @@ function Departments() {
                                                                         <p className="text-xs text-muted-foreground">
                                                                             Semester {batch.semester}
                                                                         </p>
+                                                                        <div className="mt-1 flex flex-wrap gap-1">
+                                                                            {batch.subject_ids.map((id) => {
+                                                                                const subjectName = subjectNameById.get(id);
+                                                                                return subjectName ? (
+                                                                                    <span
+                                                                                        key={id}
+                                                                                        className="rounded-full bg-primary/10 px-2 py-1 text-xs font-medium text-primary"
+                                                                                    >
+                                                                                        {subjectName}
+                                                                                    </span>
+                                                                                ) : null;
+                                                                            })}
+                                                                        </div>
                                                                     </div>
                                                                     <div className="flex gap-2 h-[stretch] items-center">
                                                                         <Button
@@ -1110,6 +1142,48 @@ function Departments() {
                                                                         }
                                                                         required
                                                                     />
+                                                                </div>
+
+                                                                <div className="space-y-2">
+                                                                    <label className="text-sm font-medium text-foreground">
+                                                                        Subjects
+                                                                    </label>
+                                                                    <select
+                                                                        multiple
+                                                                        name="subject_ids"
+                                                                        className="h-32 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                                                        value={batchFormState.subjectIds.map(String)}
+                                                                        disabled={subjects.length === 0}
+                                                                        aria-label="Select batch subjects"
+                                                                        onChange={(e) => {
+                                                                            const selected = Array.from(e.target.selectedOptions).map((option) => Number(option.value));
+                                                                            setBatchFormState((current) => ({
+                                                                                ...current,
+                                                                                subjectIds: selected,
+                                                                            }));
+                                                                        }}
+                                                                    >
+                                                                        {subjects.map((subject) => (
+                                                                            <option key={subject.id} value={subject.id}>
+                                                                                {subject.name}
+                                                                            </option>
+                                                                        ))}
+                                                                    </select>
+                                                                    <p className="text-xs text-muted-foreground">
+                                                                        Hold Ctrl (or Cmd on Mac) to select multiple subjects.
+                                                                    </p>
+                                                                    {selectedBatchSubjectNames.length > 0 && (
+                                                                        <div className="flex flex-wrap gap-2 pt-1">
+                                                                            {selectedBatchSubjectNames.map((name) => (
+                                                                                <span
+                                                                                    key={name}
+                                                                                    className="rounded-full bg-primary/10 px-2 py-1 text-xs font-medium text-primary"
+                                                                                >
+                                                                                    {name}
+                                                                                </span>
+                                                                            ))}
+                                                                        </div>
+                                                                    )}
                                                                 </div>
 
                                                                 <div className="space-y-2">

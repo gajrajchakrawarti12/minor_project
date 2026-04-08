@@ -1,0 +1,1723 @@
+package com.backend.models.autogeneration;
+
+import java.time.LocalTime;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableSet;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
+
+import com.backend.exceptions.InvalidRequestException;
+import com.backend.exceptions.TimetableGenerationTimeoutException;
+import com.backend.models.batch.BatchEntity;
+import com.backend.models.batch.BatchRepository;
+import com.backend.models.room.RoomEntity;
+import com.backend.models.room.RoomRepository;
+import com.backend.models.subject.SubjectEntity;
+import com.backend.models.teacher.TeacherEntity;
+import com.backend.models.teacher.TeacherRepository;
+import com.backend.models.timeslots.TimeSlotEntity;
+import com.backend.models.timeslots.TimeSlotRepository;
+import com.backend.models.timetable.TimetableAutoGenerateRequestModel;
+import com.backend.models.timetable.TimetableEntity;
+import com.backend.models.timetable.TimetableRepository;
+import com.backend.models.timetable.TimetableResponseModel;
+
+@Service
+public class GenerationService {
+
+    private static final Map<Long, ReentrantLock> BATCH_LOCKS = new ConcurrentHashMap<>();
+
+    @Autowired
+    private BatchRepository batchRepository;
+    @Autowired
+    private TimeSlotRepository timeSlotRepository;
+    @Autowired
+    private TeacherRepository teacherRepository;
+    @Autowired
+    private TimetableRepository timetableRepository;
+    @Autowired
+    private RoomRepository roomRepository;
+
+    @Value("${app.timetable.max-generation-ms:90000}")
+    private long maxGenerationMs;
+
+    private static final int MAX_CLASSES_PER_DAY = 6;
+    private static final int MAX_RETRY_ATTEMPTS = 5;
+    private static final int MAX_BRANCHING_OPTIONS = 8;
+    private static final int MIN_BRANCHING_OPTIONS = 4;
+    private static final int FINAL_ATTEMPT_BRANCH_BOOST = 4;
+    private static final int MAX_FINAL_BRANCHING_OPTIONS = 14;
+    private static final long MAX_RECURSIVE_STATES_PER_ATTEMPT = 300_000L;
+    private static final int CHUNKED_GENERATION_THRESHOLD = 5;
+    private static final int SINGLE_BATCH_CHUNK_THRESHOLD = 8;
+    private static final int MEDIUM_BATCH_CHUNK_THRESHOLD = 6;
+    private static final int MAX_CHUNK_ORDER_ATTEMPTS = 6;
+    private static final List<Integer> PRACTICAL_SLOT_OPTIONS = List.of(3, 2, 1);
+
+    private static final int TEACHER_LOAD_WEIGHT = 10;
+    private static final int ROOM_LOAD_WEIGHT = 5;
+    private static final int DAY_LOAD_WEIGHT = 4;
+    private static final int FALLBACK_TEACHER_PENALTY = 20;
+    private static final int TEACHER_SWITCH_PENALTY = 150;
+    private static final int GAP_PENALTY_WEIGHT = 12;
+    private static final int INTERNAL_HOLE_PENALTY = 4;
+    private static final int SAME_SUBJECT_DAY_PENALTY = 1000;
+
+    private static final Map<String, Integer> DAY_ORDER = Map.of(
+            "MONDAY", 1,
+            "TUESDAY", 2,
+            "WEDNESDAY", 3,
+            "THURSDAY", 4,
+            "FRIDAY", 5,
+            "SATURDAY", 6,
+            "SUNDAY", 7);
+
+    // ================= MAIN METHOD =================
+
+    @Transactional
+    public List<TimetableResponseModel> generateTimetable(TimetableAutoGenerateRequestModel request) {
+
+        List<ReentrantLock> acquiredLocks = lockBatches(request.getBatchIds());
+
+        try {
+            long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxGenerationMs);
+
+            List<BatchEntity> batches = batchRepository.findAllById(request.getBatchIds());
+            List<TimeSlotEntity> slots = sortTimeSlots(timeSlotRepository.findAll());
+            List<RoomEntity> rooms = roomRepository.findAll();
+
+            if (batches.isEmpty() || slots.isEmpty() || rooms.isEmpty()) {
+                throw new RuntimeException("Missing required data");
+            }
+
+            validateDaySessionFeasibility(batches, slots);
+
+            timetableRepository.deleteByBatch_IdIn(request.getBatchIds());
+            timetableRepository.flush();
+            List<TimetableEntity> existingTimetables = timetableRepository.findAll();
+
+            List<TimetableEntity> generated = generateTimetableEntities(
+                    batches,
+                    rooms,
+                    slots,
+                    existingTimetables,
+                    deadlineNanos);
+            if (generated == null || generated.isEmpty()) {
+                throw new RuntimeException("Unable to generate timetable");
+            }
+
+            validateGeneratedUniqueness(generated, existingTimetables);
+
+            return timetableRepository.saveAllAndFlush(generated)
+                    .stream()
+                    .map(this::toResponse)
+                    .toList();
+        } catch (DataIntegrityViolationException ex) {
+            throw new InvalidRequestException(
+                    "Timetable generation conflict detected. Concurrent updates likely modified teacher or room slots. Please retry.");
+        } finally {
+            unlockBatches(acquiredLocks);
+        }
+    }
+
+    public List<TimetableEntity> generateTimetableEntities(
+            List<BatchEntity> batches,
+            List<RoomEntity> rooms,
+            List<TimeSlotEntity> sortedSlots) {
+
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxGenerationMs);
+        return generateTimetableEntities(batches, rooms, sortedSlots, List.of(), deadlineNanos);
+    }
+
+    private List<TimetableEntity> generateTimetableEntities(
+            List<BatchEntity> batches,
+            List<RoomEntity> rooms,
+            List<TimeSlotEntity> sortedSlots,
+            List<TimetableEntity> existingTimetables,
+            long deadlineNanos) {
+
+        if (batches.size() >= CHUNKED_GENERATION_THRESHOLD) {
+            return generateTimetableEntitiesChunked(
+                    batches,
+                    rooms,
+                    sortedSlots,
+                    existingTimetables,
+                    deadlineNanos);
+        }
+
+        return generateTimetableEntitiesForBatchGroup(
+                batches,
+                rooms,
+                sortedSlots,
+                existingTimetables,
+                deadlineNanos);
+    }
+
+    private List<TimetableEntity> generateTimetableEntitiesChunked(
+            List<BatchEntity> batches,
+            List<RoomEntity> rooms,
+            List<TimeSlotEntity> sortedSlots,
+            List<TimetableEntity> existingTimetables,
+            long deadlineNanos) {
+
+        int baseChunkSize = resolveBatchChunkSize(batches.size());
+        List<BatchEntity> lastFailedChunk = List.of();
+
+        for (int orderAttempt = 1; orderAttempt <= MAX_CHUNK_ORDER_ATTEMPTS; orderAttempt++) {
+            if (shouldStop(deadlineNanos)) {
+                throwGenerationTimeout();
+            }
+
+            int chunkSize = resolveChunkSizeForOrderAttempt(baseChunkSize, orderAttempt);
+            List<BatchEntity> orderedBatches = orderBatchesForGeneration(batches, orderAttempt);
+
+            List<TimetableEntity> generatedAll = new ArrayList<>();
+            List<TimetableEntity> seededExisting = new ArrayList<>(existingTimetables);
+            List<BatchEntity> failedChunk = List.of();
+
+            for (int startIndex = 0; startIndex < orderedBatches.size(); startIndex += chunkSize) {
+                if (shouldStop(deadlineNanos)) {
+                    throwGenerationTimeout();
+                }
+
+                int endIndex = Math.min(startIndex + chunkSize, orderedBatches.size());
+                List<BatchEntity> chunkBatches = orderedBatches.subList(startIndex, endIndex);
+
+                List<TimetableEntity> chunkGenerated = generateTimetableEntitiesForBatchGroup(
+                        chunkBatches,
+                        rooms,
+                        sortedSlots,
+                        seededExisting,
+                        deadlineNanos);
+
+                if (chunkGenerated == null) {
+                    failedChunk = List.copyOf(chunkBatches);
+                    break;
+                }
+
+                generatedAll.addAll(chunkGenerated);
+                seededExisting.addAll(chunkGenerated);
+            }
+
+            if (failedChunk.isEmpty()) {
+                return generatedAll;
+            }
+
+            lastFailedChunk = failedChunk;
+        }
+
+        String failedGroup = lastFailedChunk.isEmpty() ? "[unknown]" : formatBatchNames(lastFailedChunk);
+        throw new InvalidRequestException(
+                "Unable to generate timetable for batch group " + failedGroup
+                        + " after trying multiple scheduling orders. Try fewer batches or reduce weekly load for these batches.");
+    }
+
+    private int resolveBatchChunkSize(int totalBatches) {
+        if (totalBatches >= SINGLE_BATCH_CHUNK_THRESHOLD) {
+            return 1;
+        }
+        if (totalBatches >= MEDIUM_BATCH_CHUNK_THRESHOLD) {
+            return 2;
+        }
+        return 3;
+    }
+
+    private int resolveChunkSizeForOrderAttempt(int baseChunkSize, int orderAttempt) {
+        if (orderAttempt <= 2) {
+            return baseChunkSize;
+        }
+        return Math.min(baseChunkSize + 1, 2);
+    }
+
+    private List<BatchEntity> orderBatchesForGeneration(List<BatchEntity> batches, int orderAttempt) {
+        List<BatchEntity> ordered = new ArrayList<>(batches);
+
+        Comparator<BatchEntity> idComparator = (orderAttempt % 2 == 0)
+                ? Comparator.comparing(BatchEntity::getId, Comparator.reverseOrder())
+                : Comparator.comparing(BatchEntity::getId);
+
+        ordered.sort(Comparator
+                .comparingInt(this::estimateBatchDemand)
+                .reversed()
+                .thenComparing(idComparator));
+
+        if (!ordered.isEmpty()) {
+            int rotation = ((orderAttempt - 1) / 2) % ordered.size();
+            if (rotation > 0) {
+                Collections.rotate(ordered, rotation);
+            }
+        }
+
+        return ordered;
+    }
+
+    private int estimateBatchDemand(BatchEntity batch) {
+        int demand = 0;
+        for (SubjectEntity subject : batch.getSubject()) {
+            int lectureCount = safe(subject.getLecture());
+            int tutorialCount = safe(subject.getTutorial());
+            int practicalCount = safe(subject.getPractical());
+            PracticalPlan practicalPlan = buildPracticalPlan(practicalCount);
+            demand += lectureCount + tutorialCount + practicalCount + practicalPlan.sessionCount();
+        }
+        return demand;
+    }
+
+    private String formatBatchNames(List<BatchEntity> batches) {
+        StringBuilder builder = new StringBuilder("[");
+        for (int i = 0; i < batches.size(); i++) {
+            if (i > 0) {
+                builder.append(", ");
+            }
+            builder.append(batches.get(i).getName());
+        }
+        builder.append("]");
+        return builder.toString();
+    }
+
+    private List<TimetableEntity> generateTimetableEntitiesForBatchGroup(
+            List<BatchEntity> batches,
+            List<RoomEntity> rooms,
+            List<TimeSlotEntity> sortedSlots,
+            List<TimetableEntity> existingTimetables,
+            long deadlineNanos) {
+
+        if (shouldStop(deadlineNanos)) {
+            throwGenerationTimeout();
+        }
+
+        List<SessionTask> baseTasks = buildTasks(batches);
+        if (baseTasks.isEmpty()) {
+            return List.of();
+        }
+
+        PrecomputedSlots precomputedSlots = initializeSlotPrecomputation(sortedSlots, rooms);
+        validateDepartmentResourceFeasibility(baseTasks, precomputedSlots);
+
+        Random seedRandom = new Random();
+
+        for (int attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+            if (shouldStop(deadlineNanos)) {
+                throwGenerationTimeout();
+            }
+
+            long seed = seedRandom.nextLong();
+            Random attemptRandom = new Random(seed);
+            boolean exhaustiveAttempt = (attempt == MAX_RETRY_ATTEMPTS);
+
+            List<SessionTask> tasks = new ArrayList<>(baseTasks);
+            Collections.shuffle(tasks, attemptRandom);
+
+            SchedulingState state = new SchedulingState(precomputedSlots.slotIndexById(), sortedSlots.size());
+            seedStateWithExistingTimetables(state, existingTimetables);
+            List<TimetableEntity> result = new ArrayList<>();
+            SearchBudget searchBudget = new SearchBudget(MAX_RECURSIVE_STATES_PER_ATTEMPT);
+
+            if (assignRecursively(tasks, result, state, precomputedSlots, searchBudget, attemptRandom, 0,
+                    exhaustiveAttempt, deadlineNanos)) {
+                return result;
+            }
+        }
+
+        if (shouldStop(deadlineNanos)) {
+            throwGenerationTimeout();
+        }
+
+        return null;
+    }
+
+    // ================= TASK BUILDER =================
+
+    private List<SessionTask> buildTasks(List<BatchEntity> batches) {
+        List<SessionTask> tasks = new ArrayList<>();
+
+        for (BatchEntity batch : batches) {
+            for (SubjectEntity subject : batch.getSubject()) {
+                Set<Long> allowedDepartmentIds = resolveAllowedDepartmentIds(batch, subject);
+
+                List<TeacherEntity> allSpecializedTeachers = teacherRepository
+                        .findDistinctBySpecializations_Id(subject.getId())
+                        .stream()
+                        .toList();
+
+                List<TeacherEntity> specializedTeachers = allSpecializedTeachers.stream()
+                        .filter(teacher -> belongsToAllowedDepartment(teacher, allowedDepartmentIds))
+                        .toList();
+
+                List<TeacherEntity> fallbackTeachers = List.of();
+
+                if (specializedTeachers.isEmpty()) {
+                    if (!allSpecializedTeachers.isEmpty()) {
+                        // Prefer subject specialization even when department mapping is incomplete.
+                        specializedTeachers = allSpecializedTeachers;
+                    } else {
+                        // Last resort: allow same-department teachers if specialization data is
+                        // missing.
+                        fallbackTeachers = findTeachersInAllowedDepartments(allowedDepartmentIds);
+                        if (fallbackTeachers.isEmpty()) {
+                            throw new InvalidRequestException(
+                                    "No teacher available for subject '" + subject.getName()
+                                            + "' in allowed departments " + allowedDepartmentIds);
+                        }
+                    }
+                }
+
+                addTasks(tasks, batch, subject, SessionType.LECTURE, safe(subject.getLecture()), 0,
+                        specializedTeachers, fallbackTeachers, allowedDepartmentIds);
+                addTasks(tasks, batch, subject, SessionType.TUTORIAL, safe(subject.getTutorial()), 0,
+                        specializedTeachers, fallbackTeachers, allowedDepartmentIds);
+
+                PracticalPlan practicalPlan = buildPracticalPlan(safe(subject.getPractical()));
+                for (int slotLength : practicalPlan.slotLengths()) {
+                    addTasks(tasks, batch, subject, SessionType.PRACTICAL, 1, slotLength,
+                            specializedTeachers, fallbackTeachers, allowedDepartmentIds);
+                }
+            }
+        }
+
+        return tasks;
+    }
+
+    private void addTasks(
+            List<SessionTask> tasks,
+            BatchEntity batch,
+            SubjectEntity subject,
+            SessionType type,
+            int count,
+            int practicalSlotLength,
+            List<TeacherEntity> specializedTeachers,
+            List<TeacherEntity> fallbackTeachers,
+            Set<Long> allowedDepartmentIds) {
+
+        for (int i = 0; i < count; i++) {
+            tasks.add(new SessionTask(batch, subject, type, specializedTeachers, fallbackTeachers, practicalSlotLength,
+                    allowedDepartmentIds));
+        }
+    }
+
+    private int safe(Integer v) {
+        return v == null ? 0 : Math.max(v, 0);
+    }
+
+    // ================= BACKTRACKING =================
+
+    private boolean assignRecursively(
+            List<SessionTask> tasks,
+            List<TimetableEntity> result,
+            SchedulingState state,
+            PrecomputedSlots precomputedSlots,
+            SearchBudget searchBudget,
+            Random random,
+            int depth,
+            boolean exhaustiveAttempt,
+            long deadlineNanos) {
+
+        if (shouldStop(deadlineNanos)) {
+            return false;
+        }
+
+        if (!searchBudget.tryVisit()) {
+            return false;
+        }
+
+        if (tasks.isEmpty()) {
+            return true;
+        }
+
+        if (shouldPrune(tasks, state)) {
+            return false;
+        }
+
+        int selectedIndex = -1;
+        List<AssignmentOption> selectedOptions = List.of();
+        int selectedTeacherPoolSize = Integer.MAX_VALUE;
+        int branchLimit = computeBranchLimit(depth, tasks.size(), exhaustiveAttempt);
+
+        for (int i = 0; i < tasks.size(); i++) {
+            if (shouldStop(deadlineNanos)) {
+                return false;
+            }
+
+            SessionTask candidateTask = tasks.get(i);
+            List<AssignmentOption> candidateOptions = getAllPossibleAssignments(
+                    candidateTask,
+                    state,
+                    precomputedSlots,
+                    branchLimit,
+                    deadlineNanos);
+
+            if (candidateOptions.isEmpty()) {
+                return false;
+            }
+
+            if (selectedIndex == -1 ||
+                    candidateOptions.size() < selectedOptions.size() ||
+                    (candidateOptions.size() == selectedOptions.size() &&
+                            candidateTask.teacherPoolSize() < selectedTeacherPoolSize)
+                    ||
+                    (candidateOptions.size() == selectedOptions.size() &&
+                            candidateTask.teacherPoolSize() == selectedTeacherPoolSize &&
+                            random.nextBoolean())) {
+                selectedIndex = i;
+                selectedOptions = candidateOptions;
+                selectedTeacherPoolSize = candidateTask.teacherPoolSize();
+            }
+        }
+
+        SessionTask task = tasks.remove(selectedIndex);
+
+        for (AssignmentOption option : selectedOptions) {
+            if (shouldStop(deadlineNanos)) {
+                tasks.add(selectedIndex, task);
+                return false;
+            }
+
+            applyAssignment(option, task, state);
+
+            int addedCount = appendTimetableEntries(result, task, option);
+
+            if (assignRecursively(tasks, result, state, precomputedSlots, searchBudget, random, depth + 1,
+                    exhaustiveAttempt, deadlineNanos)) {
+                return true;
+            }
+
+            removeLastEntries(result, addedCount);
+            rollbackAssignment(option, task, state);
+        }
+
+        tasks.add(selectedIndex, task);
+        return false;
+    }
+
+    // ================= OPTIONS =================
+
+    private List<AssignmentOption> getAllPossibleAssignments(
+            SessionTask task,
+            SchedulingState state,
+            PrecomputedSlots precomputedSlots,
+            int branchLimit,
+            long deadlineNanos) {
+
+        if (shouldStop(deadlineNanos)) {
+            return List.of();
+        }
+
+        List<AssignmentOption> bestOptions = new ArrayList<>(branchLimit);
+        Long batchId = task.getBatch().getId();
+        List<RoomEntity> roomPool = resolveRoomPool(task, state, precomputedSlots);
+        List<TeacherCandidate> teacherCandidates = resolveTeacherCandidates(task, state);
+
+        if (roomPool.isEmpty()) {
+            return List.of();
+        }
+
+        for (Long startSlotId : precomputedSlots.startSlotIds()) {
+            if (shouldStop(deadlineNanos)) {
+                return List.of();
+            }
+
+            List<SlotGroup> candidateSlotGroups = findConsecutiveSlots(task, startSlotId, precomputedSlots);
+            if (candidateSlotGroups.isEmpty()) {
+                continue;
+            }
+
+            List<SlotGroup> batchAssignableSlotGroups = filterBatchAssignableSlotGroups(
+                    task,
+                    batchId,
+                    candidateSlotGroups,
+                    state);
+            if (batchAssignableSlotGroups.isEmpty()) {
+                continue;
+            }
+
+            for (TeacherCandidate candidate : teacherCandidates) {
+                if (shouldStop(deadlineNanos)) {
+                    return List.of();
+                }
+
+                TeacherEntity teacher = candidate.teacher();
+
+                for (RoomEntity room : roomPool) {
+                    if (shouldStop(deadlineNanos)) {
+                        return List.of();
+                    }
+
+                    for (SlotGroup slotGroup : batchAssignableSlotGroups) {
+                        if (shouldStop(deadlineNanos)) {
+                            return List.of();
+                        }
+
+                        if (!isSlotGroupAssignable(batchId, teacher, room, slotGroup, state, task)) {
+                            continue;
+                        }
+
+                        int score = scoreAssignment(task, candidate, teacher, room, slotGroup, state);
+                        AssignmentOption option = new AssignmentOption(teacher, room, slotGroup, score,
+                                candidate.fallback());
+                        addTopOption(bestOptions, option, branchLimit);
+                    }
+                }
+            }
+        }
+
+        return bestOptions;
+    }
+
+    private List<SlotGroup> findConsecutiveSlots(
+            SessionTask task,
+            Long startSlotId,
+            PrecomputedSlots precomputedSlots) {
+
+        if (task.getSessionType() == SessionType.PRACTICAL) {
+            List<SlotGroup> groups = precomputedSlots.practicalGroupsByStartSlotId().getOrDefault(startSlotId,
+                    List.of());
+            if (groups.isEmpty()) {
+                return groups;
+            }
+
+            int requiredLength = task.getPracticalSlotLength();
+            if (requiredLength <= 0) {
+                return groups;
+            }
+
+            List<SlotGroup> filtered = new ArrayList<>(1);
+            for (SlotGroup group : groups) {
+                if (group.length() == requiredLength) {
+                    filtered.add(group);
+                }
+            }
+            return filtered;
+        }
+        return precomputedSlots.singleSlotGroupsByStartSlotId().getOrDefault(startSlotId, List.of());
+    }
+
+    private boolean isConsecutiveBlock(List<TimeSlotEntity> slots) {
+        if (slots.isEmpty()) {
+            return false;
+        }
+
+        String day = slots.get(0).getDay();
+        for (int i = 1; i < slots.size(); i++) {
+            TimeSlotEntity prev = slots.get(i - 1);
+            TimeSlotEntity curr = slots.get(i);
+
+            if (!day.equals(curr.getDay())) {
+                return false;
+            }
+
+            LocalTime prevEnd = prev.getEndTime();
+            LocalTime currStart = curr.getStartTime();
+            if (prevEnd == null || currStart == null || !prevEnd.equals(currStart)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private boolean isSlotGroupAssignable(
+            Long batchId,
+            TeacherEntity teacher,
+            RoomEntity room,
+            SlotGroup slotGroup,
+            SchedulingState state,
+            SessionTask task) {
+
+        if (task.getSessionType() != SessionType.PRACTICAL) {
+            Long fixedRoomId = state.nonPracticalRoomByBatch.get(batchId);
+            if (fixedRoomId != null && !fixedRoomId.equals(room.getId())) {
+                return false;
+            }
+        }
+
+        int[] slotIndexes = slotGroup.slotIndexes();
+        BitSet batchBits = state.usedBatchSlots.get(batchId);
+        BitSet teacherBits = state.usedTeacherSlots.get(teacher.getId());
+        BitSet roomBits = state.usedRoomSlots.get(room.getId());
+
+        for (int slotIndex : slotIndexes) {
+            if (batchBits != null && batchBits.get(slotIndex)) {
+                return false;
+            }
+            if (teacherBits != null && teacherBits.get(slotIndex)) {
+                return false;
+            }
+            if (roomBits != null && roomBits.get(slotIndex)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private List<SlotGroup> filterBatchAssignableSlotGroups(
+            SessionTask task,
+            Long batchId,
+            List<SlotGroup> candidateSlotGroups,
+            SchedulingState state) {
+
+        int[] dayLoad = state.batchDayLoad.computeIfAbsent(batchId, k -> new int[7]);
+        int[] practicalDayLoad = task.getSessionType() == SessionType.PRACTICAL
+                ? state.batchPracticalDayLoad.computeIfAbsent(batchId, k -> new int[7])
+                : null;
+
+        List<SlotGroup> filtered = new ArrayList<>(candidateSlotGroups.size());
+        Long subjectId = task.getSubject().getId();
+
+        for (SlotGroup slotGroup : candidateSlotGroups) {
+            int dayIndex = slotGroup.dayIndex();
+
+            if (isSubjectAlreadyScheduledOnDay(batchId, subjectId, dayIndex, state)) {
+                continue;
+            }
+
+            if (dayLoad[dayIndex] + slotGroup.length() > MAX_CLASSES_PER_DAY) {
+                continue;
+            }
+
+            if (practicalDayLoad != null && practicalDayLoad[dayIndex] >= 1) {
+                continue;
+            }
+
+            filtered.add(slotGroup);
+        }
+
+        return filtered;
+    }
+
+    private int scoreAssignment(
+            SessionTask task,
+            TeacherCandidate candidate,
+            TeacherEntity teacher,
+            RoomEntity room,
+            SlotGroup slotGroup,
+            SchedulingState state) {
+
+        Long batchId = task.getBatch().getId();
+        int[] dayLoad = state.batchDayLoad.computeIfAbsent(batchId, k -> new int[7]);
+        int subjectDayCount = isSubjectAlreadyScheduledOnDay(
+                batchId,
+                task.getSubject().getId(),
+                slotGroup.dayIndex(),
+                state) ? 1 : 0;
+
+        int gapPenalty = calculateGapPenalty(batchId, slotGroup, state);
+        long subjectKey = subjectMaskKey(batchId, task.getSubject().getId());
+        Long preferredTeacherId = state.subjectTeacherByBatchSubject.get(subjectKey);
+        int teacherSwitchPenalty = preferredTeacherId != null && !preferredTeacherId.equals(teacher.getId())
+                ? TEACHER_SWITCH_PENALTY
+                : 0;
+
+        return state.teacherLoad.getOrDefault(teacher.getId(), 0) * TEACHER_LOAD_WEIGHT
+                + state.roomLoad.getOrDefault(room.getId(), 0) * ROOM_LOAD_WEIGHT
+                + dayLoad[slotGroup.dayIndex()] * DAY_LOAD_WEIGHT
+                + (candidate.fallback() ? FALLBACK_TEACHER_PENALTY : 0)
+                + teacherSwitchPenalty
+                + gapPenalty * GAP_PENALTY_WEIGHT
+                + subjectDayCount * SAME_SUBJECT_DAY_PENALTY;
+    }
+
+    private int calculateGapPenalty(Long batchId, SlotGroup slotGroup, SchedulingState state) {
+        NavigableSet<Integer>[] daySets = state.batchDaySlotIndexes.get(batchId);
+        NavigableSet<Integer> existing = daySets == null ? null : daySets[slotGroup.dayIndex()];
+
+        if (existing == null || existing.isEmpty()) {
+            return 0;
+        }
+
+        int penalty = 0;
+        int[] slotIndexes = slotGroup.slotIndexes();
+        for (int index : slotIndexes) {
+
+            Integer floor = existing.floor(index);
+            Integer ceiling = existing.ceiling(index);
+
+            int minDistance = Integer.MAX_VALUE;
+            if (floor != null) {
+                minDistance = Math.min(minDistance, index - floor);
+            }
+            if (ceiling != null) {
+                minDistance = Math.min(minDistance, ceiling - index);
+            }
+
+            if (minDistance > 1) {
+                penalty += (minDistance - 1);
+            }
+        }
+
+        // Penalize holes inside the occupied range to keep each day compact.
+        int minIndex = existing.first();
+        int maxIndex = existing.last();
+        for (int index : slotIndexes) {
+            if (index < minIndex) {
+                minIndex = index;
+            }
+            if (index > maxIndex) {
+                maxIndex = index;
+            }
+        }
+
+        int occupiedCount = existing.size() + slotIndexes.length;
+        int holes = (maxIndex - minIndex + 1) - occupiedCount;
+        if (holes > 0) {
+            penalty += holes * INTERNAL_HOLE_PENALTY;
+        }
+
+        return penalty;
+    }
+
+    // ================= APPLY / ROLLBACK =================
+
+    private void applyAssignment(AssignmentOption opt, SessionTask task, SchedulingState state) {
+
+        Long b = task.getBatch().getId();
+        Long t = opt.teacher().getId();
+        Long r = opt.room().getId();
+        SlotGroup slotGroup = opt.slotGroup();
+        int dayIndex = slotGroup.dayIndex();
+
+        BitSet batchBitSet = state.usedBatchSlots.computeIfAbsent(b, k -> new BitSet(state.totalSlotCount));
+        BitSet teacherBitSet = state.usedTeacherSlots.computeIfAbsent(t, k -> new BitSet(state.totalSlotCount));
+        BitSet roomBitSet = state.usedRoomSlots.computeIfAbsent(r, k -> new BitSet(state.totalSlotCount));
+
+        NavigableSet<Integer>[] daySets = state.batchDaySlotIndexes.computeIfAbsent(b, k -> createDaySets());
+        NavigableSet<Integer> currentDaySet = daySets[dayIndex];
+        if (currentDaySet == null) {
+            currentDaySet = new TreeSet<>();
+            daySets[dayIndex] = currentDaySet;
+        }
+
+        for (int index : slotGroup.slotIndexes()) {
+            batchBitSet.set(index);
+            teacherBitSet.set(index);
+            roomBitSet.set(index);
+            currentDaySet.add(index);
+        }
+
+        int length = slotGroup.length();
+        state.teacherLoad.merge(t, length, Integer::sum);
+        state.roomLoad.merge(r, length, Integer::sum);
+        state.batchDayLoad.computeIfAbsent(b, k -> new int[7])[dayIndex] += length;
+        if (task.getSessionType() == SessionType.PRACTICAL) {
+            state.batchPracticalDayLoad.computeIfAbsent(b, k -> new int[7])[dayIndex] += 1;
+        }
+        setSubjectScheduledOnDay(b, task.getSubject().getId(), dayIndex, true, state);
+
+        if (task.getSessionType() != SessionType.PRACTICAL) {
+            bindNonPracticalRoom(b, r, state);
+        }
+
+        bindSubjectTeacher(b, task.getSubject().getId(), t, state);
+    }
+
+    private void rollbackAssignment(AssignmentOption opt, SessionTask task, SchedulingState state) {
+
+        Long b = task.getBatch().getId();
+        Long t = opt.teacher().getId();
+        Long r = opt.room().getId();
+        SlotGroup slotGroup = opt.slotGroup();
+        int dayIndex = slotGroup.dayIndex();
+
+        BitSet batchBitSet = state.usedBatchSlots.get(b);
+        BitSet teacherBitSet = state.usedTeacherSlots.get(t);
+        BitSet roomBitSet = state.usedRoomSlots.get(r);
+
+        for (int index : slotGroup.slotIndexes()) {
+            if (batchBitSet != null) {
+                batchBitSet.clear(index);
+            }
+            if (teacherBitSet != null) {
+                teacherBitSet.clear(index);
+            }
+            if (roomBitSet != null) {
+                roomBitSet.clear(index);
+            }
+
+            NavigableSet<Integer>[] perDay = state.batchDaySlotIndexes.get(b);
+            if (perDay != null) {
+                NavigableSet<Integer> indexes = perDay[dayIndex];
+                if (indexes != null) {
+                    indexes.remove(index);
+                    if (indexes.isEmpty()) {
+                        perDay[dayIndex] = null;
+                    }
+                }
+                if (isAllNull(perDay)) {
+                    state.batchDaySlotIndexes.remove(b);
+                }
+            }
+        }
+
+        int length = slotGroup.length();
+        decrementLoad(state.teacherLoad, t, length);
+        decrementLoad(state.roomLoad, r, length);
+
+        int[] dayLoad = state.batchDayLoad.get(b);
+        if (dayLoad != null) {
+            int updated = dayLoad[dayIndex] - length;
+            if (updated <= 0) {
+                dayLoad[dayIndex] = 0;
+            } else {
+                dayLoad[dayIndex] = updated;
+            }
+            if (isAllZero(dayLoad)) {
+                state.batchDayLoad.remove(b);
+            }
+        }
+
+        if (task.getSessionType() == SessionType.PRACTICAL) {
+            int[] practicalDayLoad = state.batchPracticalDayLoad.get(b);
+            if (practicalDayLoad != null) {
+                int updatedPractical = practicalDayLoad[dayIndex] - 1;
+                if (updatedPractical <= 0) {
+                    practicalDayLoad[dayIndex] = 0;
+                } else {
+                    practicalDayLoad[dayIndex] = updatedPractical;
+                }
+                if (isAllZero(practicalDayLoad)) {
+                    state.batchPracticalDayLoad.remove(b);
+                }
+            }
+        }
+
+        setSubjectScheduledOnDay(b, task.getSubject().getId(), dayIndex, false, state);
+
+        if (task.getSessionType() != SessionType.PRACTICAL) {
+            unbindNonPracticalRoom(b, state);
+        }
+
+        unbindSubjectTeacher(b, task.getSubject().getId(), state);
+
+        cleanupBitSet(state.usedBatchSlots, b);
+        cleanupBitSet(state.usedTeacherSlots, t);
+        cleanupBitSet(state.usedRoomSlots, r);
+    }
+
+    private boolean shouldPrune(List<SessionTask> tasks, SchedulingState state) {
+        Map<Long, Integer> minRequiredSlotsByBatch = new HashMap<>();
+        Map<Long, Integer> mandatoryRequiredSlotsByTeacher = new HashMap<>();
+        Map<Long, Integer> remainingPracticalBlocksByBatch = new HashMap<>();
+
+        for (SessionTask task : tasks) {
+            Long batchId = task.getBatch().getId();
+            int minRequiredSlots = task.minRequiredSlots();
+
+            minRequiredSlotsByBatch.merge(batchId, minRequiredSlots, Integer::sum);
+
+            if (task.getSessionType() == SessionType.PRACTICAL) {
+                remainingPracticalBlocksByBatch.merge(batchId, 1, Integer::sum);
+            }
+
+            List<TeacherCandidate> candidates = resolveTeacherCandidates(task, state);
+            if (candidates.size() == 1) {
+                mandatoryRequiredSlotsByTeacher.merge(candidates.get(0).teacher().getId(), minRequiredSlots,
+                        Integer::sum);
+            }
+        }
+
+        for (Map.Entry<Long, Integer> entry : minRequiredSlotsByBatch.entrySet()) {
+            BitSet used = state.usedBatchSlots.get(entry.getKey());
+            int usedCount = used == null ? 0 : used.cardinality();
+            int free = state.totalSlotCount - usedCount;
+            if (free < entry.getValue()) {
+                return true;
+            }
+        }
+
+        for (Map.Entry<Long, Integer> entry : mandatoryRequiredSlotsByTeacher.entrySet()) {
+            BitSet used = state.usedTeacherSlots.get(entry.getKey());
+            int usedCount = used == null ? 0 : used.cardinality();
+            int free = state.totalSlotCount - usedCount;
+            if (free < entry.getValue()) {
+                return true;
+            }
+        }
+
+        for (Map.Entry<Long, Integer> entry : remainingPracticalBlocksByBatch.entrySet()) {
+            Long batchId = entry.getKey();
+            int[] dayLoad = state.batchDayLoad.getOrDefault(batchId, new int[7]);
+            int[] practicalDayLoad = state.batchPracticalDayLoad.getOrDefault(batchId, new int[7]);
+
+            int possiblePracticalDays = 0;
+            for (int dayIndex = 0; dayIndex < 7; dayIndex++) {
+                if (practicalDayLoad[dayIndex] == 0 && dayLoad[dayIndex] < MAX_CLASSES_PER_DAY) {
+                    possiblePracticalDays++;
+                }
+            }
+
+            if (possiblePracticalDays < entry.getValue()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void addTopOption(List<AssignmentOption> bestOptions, AssignmentOption candidate, int limit) {
+        int insertAt = 0;
+        while (insertAt < bestOptions.size() && bestOptions.get(insertAt).score() <= candidate.score()) {
+            insertAt++;
+        }
+
+        if (insertAt >= limit) {
+            return;
+        }
+
+        bestOptions.add(insertAt, candidate);
+        if (bestOptions.size() > limit) {
+            bestOptions.remove(bestOptions.size() - 1);
+        }
+    }
+
+    private int computeBranchLimit(int depth, int remainingTasks, boolean exhaustiveAttempt) {
+        int depthPenalty = depth / 5;
+        int remainingBoost = remainingTasks <= 6 ? 2 : 0;
+        int baseLimit = MAX_BRANCHING_OPTIONS - depthPenalty + remainingBoost;
+
+        if (exhaustiveAttempt) {
+            int boostedLimit = baseLimit + FINAL_ATTEMPT_BRANCH_BOOST;
+            return Math.max(MIN_BRANCHING_OPTIONS, Math.min(MAX_FINAL_BRANCHING_OPTIONS, boostedLimit));
+        }
+
+        return Math.max(MIN_BRANCHING_OPTIONS, Math.min(MAX_BRANCHING_OPTIONS, baseLimit));
+    }
+
+    private void validateDaySessionFeasibility(List<BatchEntity> batches, List<TimeSlotEntity> slots) {
+        boolean[] dayExists = new boolean[7];
+        int[] dayCapacity = new int[7];
+        int availableDays = 0;
+        for (TimeSlotEntity slot : slots) {
+            int dayIdx = dayIndex(slot.getDay());
+            if (dayIdx >= 0 && !dayExists[dayIdx]) {
+                dayExists[dayIdx] = true;
+                availableDays++;
+            }
+
+            if (dayIdx >= 0 && dayCapacity[dayIdx] < MAX_CLASSES_PER_DAY) {
+                dayCapacity[dayIdx] += 1;
+            }
+        }
+
+        int totalCapacity = 0;
+        for (int dailyCapacity : dayCapacity) {
+            totalCapacity += dailyCapacity;
+        }
+
+        for (BatchEntity batch : batches) {
+            int requiredTotalSlots = 0;
+            int requiredPracticalBlocks = 0;
+
+            for (SubjectEntity subject : batch.getSubject()) {
+                int lectureCount = safe(subject.getLecture());
+                int tutorialCount = safe(subject.getTutorial());
+                int practicalUnits = safe(subject.getPractical());
+
+                PracticalPlan practicalPlan = buildPracticalPlan(safe(subject.getPractical()));
+                int requiredSessions = lectureCount
+                        + tutorialCount
+                        + practicalPlan.sessionCount();
+                if (requiredSessions > availableDays) {
+                    throw new InvalidRequestException(
+                            "Infeasible timetable: subject '" + subject.getName() +
+                                    "' in batch '" + batch.getName() + "' requires " + requiredSessions +
+                                    " sessions, but only " + availableDays + " distinct days are available");
+                }
+
+                requiredTotalSlots += lectureCount + tutorialCount + practicalUnits;
+                requiredPracticalBlocks += practicalPlan.sessionCount();
+            }
+
+            if (requiredTotalSlots > totalCapacity) {
+                throw new InvalidRequestException(
+                        "Infeasible timetable: batch '" + batch.getName() + "' requires " + requiredTotalSlots
+                                + " total periods, but only " + totalCapacity + " periods are schedulable");
+            }
+
+            if (requiredPracticalBlocks > availableDays) {
+                throw new InvalidRequestException(
+                        "Infeasible timetable: batch '" + batch.getName() + "' requires " + requiredPracticalBlocks
+                                + " practical blocks, but only " + availableDays
+                                + " practical days are possible with one practical per day");
+            }
+        }
+    }
+
+    private boolean isUsed(Map<Long, BitSet> usedMap, Long entityId, int slotIndex) {
+        BitSet bitSet = usedMap.get(entityId);
+        return bitSet != null && bitSet.get(slotIndex);
+    }
+
+    private void cleanupBitSet(Map<Long, BitSet> map, Long key) {
+        BitSet bitSet = map.get(key);
+        if (bitSet != null && bitSet.isEmpty()) {
+            map.remove(key);
+        }
+    }
+
+    private int appendTimetableEntries(List<TimetableEntity> result, SessionTask task, AssignmentOption option) {
+        for (TimeSlotEntity slot : option.slotGroup().slots()) {
+            TimetableEntity entry = new TimetableEntity();
+            entry.setBatch(task.getBatch());
+            entry.setSubject(task.getSubject());
+            entry.setTeacher(option.teacher());
+            entry.setRoom(option.room());
+            entry.setTimeSlot(slot);
+            result.add(entry);
+        }
+        return option.slotGroup().length();
+    }
+
+    private void removeLastEntries(List<TimetableEntity> result, int count) {
+        for (int i = 0; i < count; i++) {
+            result.remove(result.size() - 1);
+        }
+    }
+
+    private void decrementLoad(Map<Long, Integer> loadMap, Long id, int delta) {
+        int updated = loadMap.getOrDefault(id, 0) - delta;
+        if (updated <= 0) {
+            loadMap.remove(id);
+            return;
+        }
+        loadMap.put(id, updated);
+    }
+
+    private List<TimeSlotEntity> sortTimeSlots(List<TimeSlotEntity> slots) {
+        List<TimeSlotEntity> sorted = new ArrayList<>(slots);
+        sorted.sort(Comparator
+                .comparingInt(
+                        (TimeSlotEntity slot) -> DAY_ORDER.getOrDefault(normalizeDay(slot.getDay()), Integer.MAX_VALUE))
+                .thenComparing(TimeSlotEntity::getStartTime)
+                .thenComparing(TimeSlotEntity::getEndTime)
+                .thenComparing(TimeSlotEntity::getId));
+        return sorted;
+    }
+
+    private String normalizeDay(String day) {
+        return day == null ? "" : day.trim().toUpperCase();
+    }
+
+    private Map<Long, Integer> buildSlotIndex(List<TimeSlotEntity> slots) {
+        Map<Long, Integer> indexById = new HashMap<>();
+        for (int i = 0; i < slots.size(); i++) {
+            indexById.put(slots.get(i).getId(), i);
+        }
+        return indexById;
+    }
+
+    private PrecomputedSlots initializeSlotPrecomputation(List<TimeSlotEntity> sortedSlots, List<RoomEntity> rooms) {
+        Map<Long, Integer> slotIndexById = buildSlotIndex(sortedSlots);
+        Map<Long, List<SlotGroup>> singleGroupsByStartSlot = new HashMap<>();
+        Map<Long, List<SlotGroup>> practicalGroupsByStartSlot = new HashMap<>();
+        List<Long> startSlotIds = new ArrayList<>(sortedSlots.size());
+
+        for (int i = 0; i < sortedSlots.size(); i++) {
+            TimeSlotEntity startSlot = sortedSlots.get(i);
+            startSlotIds.add(startSlot.getId());
+
+            int dayIndex = dayIndex(startSlot.getDay());
+            if (dayIndex < 0) {
+                singleGroupsByStartSlot.put(startSlot.getId(), List.of());
+                practicalGroupsByStartSlot.put(startSlot.getId(), List.of());
+                continue;
+            }
+
+            singleGroupsByStartSlot.put(
+                    startSlot.getId(),
+                    List.of(new SlotGroup(List.of(startSlot), new int[] { i }, dayIndex, 1)));
+
+            List<SlotGroup> practicalGroups = new ArrayList<>();
+            for (Integer length : PRACTICAL_SLOT_OPTIONS) {
+                if (i + length > sortedSlots.size()) {
+                    continue;
+                }
+
+                List<TimeSlotEntity> window = sortedSlots.subList(i, i + length);
+                if (isConsecutiveBlock(window)) {
+                    int[] indexes = new int[length];
+                    for (int j = 0; j < length; j++) {
+                        indexes[j] = i + j;
+                    }
+                    practicalGroups.add(new SlotGroup(new ArrayList<>(window), indexes, dayIndex, length));
+                }
+            }
+
+            practicalGroupsByStartSlot.put(
+                    startSlot.getId(),
+                    practicalGroups.isEmpty() ? List.of() : List.copyOf(practicalGroups));
+        }
+
+        return new PrecomputedSlots(
+                slotIndexById,
+                singleGroupsByStartSlot,
+                practicalGroupsByStartSlot,
+                List.copyOf(startSlotIds),
+                buildLabRoomsCache(rooms),
+                buildNonLabRoomsCache(rooms),
+                buildNonLabRoomIndex(rooms));
+    }
+
+    private int dayIndex(String day) {
+        Integer order = DAY_ORDER.getOrDefault(normalizeDay(day), 0);
+        return order == 0 ? -1 : order - 1;
+    }
+
+    private PracticalPlan buildPracticalPlan(int practicalUnits) {
+        if (practicalUnits <= 0) {
+            return new PracticalPlan(0, List.of());
+        }
+
+        int bestCount = Integer.MAX_VALUE;
+        int bestThreeCount = -1;
+        int bestTwoCount = -1;
+
+        for (int threeCount = practicalUnits / 3; threeCount >= 0; threeCount--) {
+            int remaining = practicalUnits - (threeCount * 3);
+            if (remaining % 2 != 0) {
+                continue;
+            }
+
+            int twoCount = remaining / 2;
+            int blockCount = threeCount + twoCount;
+            if (blockCount < bestCount) {
+                bestCount = blockCount;
+                bestThreeCount = threeCount;
+                bestTwoCount = twoCount;
+            }
+        }
+
+        if (bestCount == Integer.MAX_VALUE) {
+            // practicalUnits=1 cannot be expressed using 2/3 blocks, so schedule as one
+            // single-slot practical.
+            return new PracticalPlan(1, List.of(1));
+        }
+
+        List<Integer> slotLengths = new ArrayList<>(bestCount);
+        for (int i = 0; i < bestThreeCount; i++) {
+            slotLengths.add(3);
+        }
+        for (int i = 0; i < bestTwoCount; i++) {
+            slotLengths.add(2);
+        }
+
+        return new PracticalPlan(bestCount, List.copyOf(slotLengths));
+    }
+
+    private List<RoomEntity> buildLabRoomsCache(List<RoomEntity> rooms) {
+        List<RoomEntity> labs = new ArrayList<>();
+        for (RoomEntity room : rooms) {
+            if (room.isLab()) {
+                labs.add(room);
+            }
+        }
+        return List.copyOf(labs);
+    }
+
+    private List<RoomEntity> buildNonLabRoomsCache(List<RoomEntity> rooms) {
+        List<RoomEntity> nonLabs = new ArrayList<>();
+        for (RoomEntity room : rooms) {
+            if (!room.isLab()) {
+                nonLabs.add(room);
+            }
+        }
+        return List.copyOf(nonLabs);
+    }
+
+    private Map<Long, RoomEntity> buildNonLabRoomIndex(List<RoomEntity> rooms) {
+        Map<Long, RoomEntity> roomById = new HashMap<>();
+        for (RoomEntity room : rooms) {
+            if (room.isLab() || room.getId() == null) {
+                continue;
+            }
+            roomById.put(room.getId(), room);
+        }
+        return Map.copyOf(roomById);
+    }
+
+    private Set<Long> resolveAllowedDepartmentIds(BatchEntity batch, SubjectEntity subject) {
+        HashSet<Long> departmentIds = new HashSet<>();
+        if (subject.getDepartments() != null) {
+            subject.getDepartments().forEach(department -> {
+                if (department != null && department.getId() != null) {
+                    departmentIds.add(department.getId());
+                }
+            });
+        }
+
+        if (departmentIds.isEmpty() && batch.getDepartment() != null && batch.getDepartment().getId() != null) {
+            departmentIds.add(batch.getDepartment().getId());
+        }
+
+        return Set.copyOf(departmentIds);
+    }
+
+    private boolean belongsToAllowedDepartment(TeacherEntity teacher, Set<Long> allowedDepartmentIds) {
+        if (teacher.getDepartment() == null || teacher.getDepartment().getId() == null) {
+            return false;
+        }
+        return allowedDepartmentIds.contains(teacher.getDepartment().getId());
+    }
+
+    private List<TeacherEntity> findTeachersInAllowedDepartments(Set<Long> allowedDepartmentIds) {
+        Map<Long, TeacherEntity> uniqueTeachers = new HashMap<>();
+        for (Long departmentId : allowedDepartmentIds) {
+            List<TeacherEntity> teachers = teacherRepository.findByDepartment_Id(departmentId);
+            for (TeacherEntity teacher : teachers) {
+                uniqueTeachers.putIfAbsent(teacher.getId(), teacher);
+            }
+        }
+        return List.copyOf(uniqueTeachers.values());
+    }
+
+    private void validateDepartmentResourceFeasibility(List<SessionTask> tasks, PrecomputedSlots precomputedSlots) {
+        if (precomputedSlots.nonLabRooms().isEmpty()) {
+            for (SessionTask task : tasks) {
+                if (task.getSessionType() != SessionType.PRACTICAL) {
+                    throw new InvalidRequestException(
+                            "No non-lab classrooms available for lecture/tutorial scheduling");
+                }
+            }
+        }
+
+        HashSet<Long> checkedPracticalKeys = new HashSet<>();
+        for (SessionTask task : tasks) {
+            if (task.getSessionType() != SessionType.PRACTICAL) {
+                continue;
+            }
+            long key = subjectMaskKey(task.getBatch().getId(), task.getSubject().getId());
+            if (!checkedPracticalKeys.add(key)) {
+                continue;
+            }
+
+            if (getDepartmentalLabs(task, precomputedSlots).isEmpty()) {
+                throw new InvalidRequestException(
+                        "No departmental lab available for practical subject '"
+                                + task.getSubject().getName() + "'");
+            }
+        }
+    }
+
+    private List<RoomEntity> getDepartmentalLabs(SessionTask task, PrecomputedSlots precomputedSlots) {
+        List<RoomEntity> matches = new ArrayList<>();
+        for (RoomEntity room : precomputedSlots.labRooms()) {
+            if (room.getDepartment() == null || room.getDepartment().getId() == null) {
+                continue;
+            }
+            if (task.getAllowedDepartmentIds().contains(room.getDepartment().getId())) {
+                matches.add(room);
+            }
+        }
+        return matches;
+    }
+
+    private List<RoomEntity> resolveRoomPool(SessionTask task, SchedulingState state,
+            PrecomputedSlots precomputedSlots) {
+        if (task.getSessionType() == SessionType.PRACTICAL) {
+            return getDepartmentalLabs(task, precomputedSlots);
+        }
+
+        Long fixedRoomId = state.nonPracticalRoomByBatch.get(task.getBatch().getId());
+        if (fixedRoomId == null) {
+            return precomputedSlots.nonLabRooms();
+        }
+
+        RoomEntity fixedRoom = precomputedSlots.nonLabRoomById().get(fixedRoomId);
+        return fixedRoom == null ? List.of() : List.of(fixedRoom);
+    }
+
+    private List<TeacherCandidate> resolveTeacherCandidates(SessionTask task, SchedulingState state) {
+        long key = subjectMaskKey(task.getBatch().getId(), task.getSubject().getId());
+        Long boundTeacherId = state.subjectTeacherByBatchSubject.get(key);
+        List<TeacherCandidate> candidates = task.getTeacherCandidates();
+
+        if (boundTeacherId != null) {
+            for (TeacherCandidate candidate : candidates) {
+                if (boundTeacherId.equals(candidate.teacher().getId())) {
+                    return List.of(candidate);
+                }
+            }
+        }
+
+        List<TeacherCandidate> ordered = new ArrayList<>(candidates);
+        ordered.sort(Comparator
+                .comparingInt(
+                        (TeacherCandidate candidate) -> state.teacherLoad.getOrDefault(candidate.teacher().getId(), 0))
+                .thenComparing(candidate -> candidate.teacher().getId()));
+        return ordered;
+    }
+
+    private void bindNonPracticalRoom(Long batchId, Long roomId, SchedulingState state) {
+        state.nonPracticalRoomByBatch.putIfAbsent(batchId, roomId);
+        state.nonPracticalRoomUsageCountByBatch.merge(batchId, 1, Integer::sum);
+    }
+
+    private void unbindNonPracticalRoom(Long batchId, SchedulingState state) {
+        int updated = state.nonPracticalRoomUsageCountByBatch.getOrDefault(batchId, 0) - 1;
+        if (updated <= 0) {
+            state.nonPracticalRoomUsageCountByBatch.remove(batchId);
+            state.nonPracticalRoomByBatch.remove(batchId);
+            return;
+        }
+        state.nonPracticalRoomUsageCountByBatch.put(batchId, updated);
+    }
+
+    private void bindSubjectTeacher(Long batchId, Long subjectId, Long teacherId, SchedulingState state) {
+        long key = subjectMaskKey(batchId, subjectId);
+        state.subjectTeacherByBatchSubject.putIfAbsent(key, teacherId);
+        state.subjectTeacherUsageCount.merge(key, 1, Integer::sum);
+    }
+
+    private void unbindSubjectTeacher(Long batchId, Long subjectId, SchedulingState state) {
+        long key = subjectMaskKey(batchId, subjectId);
+        int updated = state.subjectTeacherUsageCount.getOrDefault(key, 0) - 1;
+        if (updated <= 0) {
+            state.subjectTeacherUsageCount.remove(key);
+            state.subjectTeacherByBatchSubject.remove(key);
+            return;
+        }
+        state.subjectTeacherUsageCount.put(key, updated);
+    }
+
+    private boolean isSubjectAlreadyScheduledOnDay(Long batchId, Long subjectId, int dayIndex, SchedulingState state) {
+        long key = subjectMaskKey(batchId, subjectId);
+        Byte mask = state.subjectPerDayMask.get(key);
+        if (mask == null) {
+            return false;
+        }
+        return ((mask >> dayIndex) & 1) == 1;
+    }
+
+    private void setSubjectScheduledOnDay(Long batchId, Long subjectId, int dayIndex, boolean present,
+            SchedulingState state) {
+        long key = subjectMaskKey(batchId, subjectId);
+        byte mask = state.subjectPerDayMask.getOrDefault(key, (byte) 0);
+        if (present) {
+            mask = (byte) (mask | (1 << dayIndex));
+            state.subjectPerDayMask.put(key, mask);
+            return;
+        }
+
+        mask = (byte) (mask & ~(1 << dayIndex));
+        if (mask == 0) {
+            state.subjectPerDayMask.remove(key);
+        } else {
+            state.subjectPerDayMask.put(key, mask);
+        }
+    }
+
+    private long subjectMaskKey(Long batchId, Long subjectId) {
+        return (batchId << 32) ^ (subjectId & 0xffffffffL);
+    }
+
+    private List<ReentrantLock> lockBatches(Iterable<Long> batchIds) {
+        List<Long> ids = new ArrayList<>();
+        for (Long id : batchIds) {
+            ids.add(id);
+        }
+        ids.sort(Long::compareTo);
+
+        List<ReentrantLock> locks = new ArrayList<>(ids.size());
+        for (Long id : ids) {
+            ReentrantLock lock = BATCH_LOCKS.computeIfAbsent(id, ignored -> new ReentrantLock());
+            lock.lock();
+            locks.add(lock);
+        }
+        return locks;
+    }
+
+    private void unlockBatches(List<ReentrantLock> locks) {
+        for (int i = locks.size() - 1; i >= 0; i--) {
+            locks.get(i).unlock();
+        }
+    }
+
+    private void seedStateWithExistingTimetables(SchedulingState state, List<TimetableEntity> existingTimetables) {
+        for (TimetableEntity row : existingTimetables) {
+            if (row.getTimeSlot() == null || row.getTeacher() == null || row.getRoom() == null
+                    || row.getBatch() == null) {
+                continue;
+            }
+
+            Integer slotIndex = state.slotIndexById.get(row.getTimeSlot().getId());
+            if (slotIndex == null) {
+                continue;
+            }
+
+            Long batchId = row.getBatch().getId();
+            Long teacherId = row.getTeacher().getId();
+            Long roomId = row.getRoom().getId();
+
+            state.usedBatchSlots.computeIfAbsent(batchId, ignored -> new BitSet(state.totalSlotCount)).set(slotIndex);
+            state.usedTeacherSlots.computeIfAbsent(teacherId, ignored -> new BitSet(state.totalSlotCount))
+                    .set(slotIndex);
+            state.usedRoomSlots.computeIfAbsent(roomId, ignored -> new BitSet(state.totalSlotCount)).set(slotIndex);
+
+            state.teacherLoad.merge(teacherId, 1, Integer::sum);
+            state.roomLoad.merge(roomId, 1, Integer::sum);
+        }
+    }
+
+    private void validateGeneratedUniqueness(List<TimetableEntity> generated) {
+        HashSet<SlotPair> batchSlot = new HashSet<>();
+        HashSet<SlotPair> teacherSlot = new HashSet<>();
+        HashSet<SlotPair> roomSlot = new HashSet<>();
+
+        for (TimetableEntity row : generated) {
+            Long slotId = row.getTimeSlot().getId();
+
+            if (!batchSlot.add(new SlotPair(row.getBatch().getId(), slotId))) {
+                throw new InvalidRequestException("Generated timetable contains duplicate batch-slot assignment");
+            }
+            if (!teacherSlot.add(new SlotPair(row.getTeacher().getId(), slotId))) {
+                throw new InvalidRequestException("Generated timetable contains duplicate teacher-slot assignment");
+            }
+            if (!roomSlot.add(new SlotPair(row.getRoom().getId(), slotId))) {
+                throw new InvalidRequestException("Generated timetable contains duplicate room-slot assignment");
+            }
+        }
+    }
+
+    private void validateGeneratedUniqueness(List<TimetableEntity> generated,
+            List<TimetableEntity> existingTimetables) {
+        HashSet<SlotPair> batchSlot = new HashSet<>();
+        HashSet<SlotPair> teacherSlot = new HashSet<>();
+        HashSet<SlotPair> roomSlot = new HashSet<>();
+
+        for (TimetableEntity row : existingTimetables) {
+            if (row.getTimeSlot() == null || row.getTeacher() == null || row.getRoom() == null
+                    || row.getBatch() == null) {
+                continue;
+            }
+            Long slotId = row.getTimeSlot().getId();
+            batchSlot.add(new SlotPair(row.getBatch().getId(), slotId));
+            teacherSlot.add(new SlotPair(row.getTeacher().getId(), slotId));
+            roomSlot.add(new SlotPair(row.getRoom().getId(), slotId));
+        }
+
+        for (TimetableEntity row : generated) {
+            Long slotId = row.getTimeSlot().getId();
+
+            if (!batchSlot.add(new SlotPair(row.getBatch().getId(), slotId))) {
+                throw new InvalidRequestException("Generated timetable contains duplicate batch-slot assignment");
+            }
+            if (!teacherSlot.add(new SlotPair(row.getTeacher().getId(), slotId))) {
+                throw new InvalidRequestException(
+                        "Generated timetable conflicts with existing teacher-slot assignment");
+            }
+            if (!roomSlot.add(new SlotPair(row.getRoom().getId(), slotId))) {
+                throw new InvalidRequestException("Generated timetable conflicts with existing room-slot assignment");
+            }
+        }
+    }
+
+    private boolean shouldStop(long deadlineNanos) {
+        return Thread.currentThread().isInterrupted() || System.nanoTime() > deadlineNanos;
+    }
+
+    private void throwGenerationTimeout() {
+        throw new TimetableGenerationTimeoutException(
+                "Timetable generation exceeded the configured time limit of " + maxGenerationMs
+                        + " ms. Try fewer batches or increase TIMETABLE_MAX_GENERATION_MS.");
+    }
+
+    @SuppressWarnings("unchecked")
+    private NavigableSet<Integer>[] createDaySets() {
+        return (NavigableSet<Integer>[]) new NavigableSet[7];
+    }
+
+    private boolean isAllNull(NavigableSet<Integer>[] sets) {
+        for (NavigableSet<Integer> set : sets) {
+            if (set != null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isAllZero(int[] values) {
+        for (int value : values) {
+            if (value != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ================= MODELS =================
+
+    private record AssignmentOption(
+            TeacherEntity teacher,
+            RoomEntity room,
+            SlotGroup slotGroup,
+            int score,
+            boolean usesFallbackTeacher) {
+    }
+
+    private record SlotGroup(
+            List<TimeSlotEntity> slots,
+            int[] slotIndexes,
+            int dayIndex,
+            int length) {
+    }
+
+    private record PracticalPlan(int sessionCount, List<Integer> slotLengths) {
+    }
+
+    private record TeacherCandidate(TeacherEntity teacher, boolean fallback) {
+    }
+
+    private record SlotPair(Long left, Long right) {
+    }
+
+    private static class SearchBudget {
+        private final long maxStates;
+        private long visitedStates;
+
+        private SearchBudget(long maxStates) {
+            this.maxStates = maxStates;
+        }
+
+        private boolean tryVisit() {
+            if (visitedStates >= maxStates) {
+                return false;
+            }
+
+            visitedStates++;
+            return true;
+        }
+    }
+
+    private record PrecomputedSlots(
+            Map<Long, Integer> slotIndexById,
+            Map<Long, List<SlotGroup>> singleSlotGroupsByStartSlotId,
+            Map<Long, List<SlotGroup>> practicalGroupsByStartSlotId,
+            List<Long> startSlotIds,
+            List<RoomEntity> labRooms,
+            List<RoomEntity> nonLabRooms,
+            Map<Long, RoomEntity> nonLabRoomById) {
+    }
+
+    private enum SessionType {
+        LECTURE,
+        TUTORIAL,
+        PRACTICAL
+    }
+
+    private static class SchedulingState {
+        private final Map<Long, Integer> slotIndexById;
+        private final int totalSlotCount;
+        private final Map<Long, BitSet> usedBatchSlots = new HashMap<>();
+        private final Map<Long, BitSet> usedTeacherSlots = new HashMap<>();
+        private final Map<Long, BitSet> usedRoomSlots = new HashMap<>();
+        private final Map<Long, Integer> teacherLoad = new HashMap<>();
+        private final Map<Long, Integer> roomLoad = new HashMap<>();
+        private final Map<Long, int[]> batchDayLoad = new HashMap<>();
+        private final Map<Long, int[]> batchPracticalDayLoad = new HashMap<>();
+        private final Map<Long, Byte> subjectPerDayMask = new HashMap<>();
+        private final Map<Long, NavigableSet<Integer>[]> batchDaySlotIndexes = new HashMap<>();
+        private final Map<Long, Long> nonPracticalRoomByBatch = new HashMap<>();
+        private final Map<Long, Integer> nonPracticalRoomUsageCountByBatch = new HashMap<>();
+        private final Map<Long, Long> subjectTeacherByBatchSubject = new HashMap<>();
+        private final Map<Long, Integer> subjectTeacherUsageCount = new HashMap<>();
+
+        private SchedulingState(Map<Long, Integer> slotIndexById, int totalSlotCount) {
+            this.slotIndexById = slotIndexById;
+            this.totalSlotCount = totalSlotCount;
+        }
+    }
+
+    private static class SessionTask {
+        private final BatchEntity batch;
+        private final SubjectEntity subject;
+        private final SessionType sessionType;
+        private final List<TeacherCandidate> teacherCandidates;
+        private final int practicalSlotLength;
+        private final Set<Long> allowedDepartmentIds;
+
+        public SessionTask(
+                BatchEntity batch,
+                SubjectEntity subject,
+                SessionType sessionType,
+                List<TeacherEntity> specializedTeachers,
+                List<TeacherEntity> fallbackTeachers,
+                int practicalSlotLength,
+                Set<Long> allowedDepartmentIds) {
+            this.batch = batch;
+            this.subject = subject;
+            this.sessionType = sessionType;
+            this.practicalSlotLength = practicalSlotLength;
+            this.allowedDepartmentIds = Set.copyOf(allowedDepartmentIds);
+
+            List<TeacherCandidate> candidates = new ArrayList<>();
+            for (TeacherEntity teacher : specializedTeachers) {
+                candidates.add(new TeacherCandidate(teacher, false));
+            }
+            for (TeacherEntity teacher : fallbackTeachers) {
+                candidates.add(new TeacherCandidate(teacher, true));
+            }
+            this.teacherCandidates = candidates;
+        }
+
+        public BatchEntity getBatch() {
+            return batch;
+        }
+
+        public SubjectEntity getSubject() {
+            return subject;
+        }
+
+        public SessionType getSessionType() {
+            return sessionType;
+        }
+
+        public List<TeacherCandidate> getTeacherCandidates() {
+            return teacherCandidates;
+        }
+
+        public int getPracticalSlotLength() {
+            return practicalSlotLength;
+        }
+
+        public Set<Long> getAllowedDepartmentIds() {
+            return allowedDepartmentIds;
+        }
+
+        public int teacherPoolSize() {
+            return teacherCandidates.size();
+        }
+
+        public int minRequiredSlots() {
+            if (sessionType != SessionType.PRACTICAL) {
+                return 1;
+            }
+            return practicalSlotLength > 0 ? practicalSlotLength : 2;
+        }
+    }
+
+    private TimetableResponseModel toResponse(TimetableEntity e) {
+        return new TimetableResponseModel(
+                e.getId(),
+                e.getBatch().getId(),
+                e.getSubject().getId(),
+                e.getTeacher().getId(),
+                e.getTimeSlot().getId(),
+                e.getRoom().getId());
+    }
+}
