@@ -3,10 +3,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, CheckCircle, Filter, WandSparkles } from "lucide-react";
 
-import { listBatches, type Batch } from "@/features/batches/batchApi";
-import { listRooms, type Room } from "@/features/room/roomApi";
-import { listSubjects, type Subject } from "@/features/subject/subjectApi";
-import { listTeachers, type Teacher } from "@/features/teacher/teacherApi";
+import { listBatches, type Batch } from "@/features/batches/api/batchApi";
+import { listRooms, type Room } from "@/features/rooms/api/roomApi";
+import { listSubjects, type Subject } from "@/features/subjects/api/subjectApi";
+import { listTeachers, type Teacher } from "@/features/teachers/api/teacherApi";
 import type { ApiError } from "@/shared/api/http";
 import { Alert, AlertDescription } from "@/shared/components/ui/alert";
 import { Button } from "@/shared/components/ui/button";
@@ -18,7 +18,7 @@ import {
     type TimeSlot,
     listTimetables,
     type Timetable,
-} from "./timetableApi";
+} from "./api/timetableApi";
 
 const weekdayOrder = [
     "MONDAY",
