@@ -12,7 +12,6 @@ import org.springframework.stereotype.Service;
 
 import com.backend.common.exception.InvalidCredentialException;
 import com.backend.common.exception.UserAlreadyExistsException;
-import com.backend.auth.JWTService;
 
 @Service
 public class UserService implements UserDetailsService {

@@ -26,6 +26,8 @@ final class SchedulingConstants {
     static final int GAP_PENALTY_WEIGHT = 12;
     static final int INTERNAL_HOLE_PENALTY = 4;
     static final int SAME_SUBJECT_DAY_PENALTY = 1000;
+    static final int ROOM_SWITCH_PENALTY = 25; // High enough to matter, low enough to not break the solver
+
 
     static final Map<String, Integer> DAY_ORDER = Map.of(
             "MONDAY", 1,

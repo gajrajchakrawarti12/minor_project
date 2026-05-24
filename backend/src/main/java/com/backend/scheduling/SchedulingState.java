@@ -22,6 +22,7 @@ final class SchedulingState {
     final Map<Long, Integer> nonPracticalRoomUsageCountByBatch = new HashMap<>();
     final Map<Long, Long> subjectTeacherByBatchSubject = new HashMap<>();
     final Map<Long, Integer> subjectTeacherUsageCount = new HashMap<>();
+    public Map<Long, Long[]> batchRoomAssignments = new HashMap<>();
 
     SchedulingState(Map<Long, Integer> slotIndexById, int totalSlotCount) {
         this.slotIndexById = slotIndexById;

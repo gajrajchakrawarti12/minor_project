@@ -512,6 +512,46 @@ public class GenerationService {
         return false;
     }
 
+    private int calculateRoomSwitchPenalty(Long batchId, Long proposedRoomId, SlotGroup slotGroup,
+            SchedulingState state) {
+        Long[] roomAssignments = state.batchRoomAssignments.get(batchId);
+        if (roomAssignments == null) {
+            return 0; // No classes scheduled yet
+        }
+
+        int penalty = 0;
+        int[] indexes = slotGroup.slotIndexes();
+        int firstSlot = indexes[0];
+        int lastSlot = indexes[indexes.length - 1];
+
+        // Get the slots currently scheduled for this batch on this specific day
+        NavigableSet<Integer> daySlots = state.batchDaySlotIndexes.get(batchId) != null
+                ? state.batchDaySlotIndexes.get(batchId)[slotGroup.dayIndex()]
+                : null;
+
+        if (daySlots != null) {
+            // Check the slot IMMEDIATELY BEFORE this one
+            Integer prevSlot = daySlots.lower(firstSlot);
+            if (prevSlot != null && prevSlot == firstSlot - 1) {
+                Long prevRoom = roomAssignments[prevSlot];
+                if (prevRoom != null && !prevRoom.equals(proposedRoomId)) {
+                    penalty += ROOM_SWITCH_PENALTY;
+                }
+            }
+
+            // Check the slot IMMEDIATELY AFTER this one
+            Integer nextSlot = daySlots.higher(lastSlot);
+            if (nextSlot != null && nextSlot == lastSlot + 1) {
+                Long nextRoom = roomAssignments[nextSlot];
+                if (nextRoom != null && !nextRoom.equals(proposedRoomId)) {
+                    penalty += ROOM_SWITCH_PENALTY;
+                }
+            }
+        }
+
+        return penalty;
+    }
+
     // ================= OPTIONS =================
 
     private int countAssignableOptions(
@@ -711,13 +751,6 @@ public class GenerationService {
             BitSet teacherBits,
             BitSet roomBits) {
 
-        if (task.getSessionType() != SessionType.PRACTICAL) {
-            Long fixedRoomId = state.nonPracticalRoomByBatch.get(batchId);
-            if (fixedRoomId != null && !fixedRoomId.equals(room.getId())) {
-                return false;
-            }
-        }
-
         int[] slotIndexes = slotGroup.slotIndexes();
         for (int slotIndex : slotIndexes) {
             if (batchBits != null && batchBits.get(slotIndex)) {
@@ -815,6 +848,7 @@ public class GenerationService {
         int teacherSwitchPenalty = preferredTeacherId != null && !preferredTeacherId.equals(teacher.getId())
                 ? TEACHER_SWITCH_PENALTY
                 : 0;
+        int roomSwitchPenalty = calculateRoomSwitchPenalty(batchId, room.getId(), slotGroup, state);
 
         return state.teacherLoad.getOrDefault(teacher.getId(), 0) * TEACHER_LOAD_WEIGHT
                 + state.roomLoad.getOrDefault(room.getId(), 0) * ROOM_LOAD_WEIGHT
@@ -822,7 +856,8 @@ public class GenerationService {
                 + (candidate.fallback() ? FALLBACK_TEACHER_PENALTY : 0)
                 + teacherSwitchPenalty
                 + gapPenalty * GAP_PENALTY_WEIGHT
-                + subjectDayCount * SAME_SUBJECT_DAY_PENALTY;
+                + subjectDayCount * SAME_SUBJECT_DAY_PENALTY
+                + roomSwitchPenalty;
     }
 
     private int calculateGapPenalty(Long batchId, SlotGroup slotGroup, SchedulingState state) {
@@ -883,6 +918,7 @@ public class GenerationService {
         Long r = opt.room().getId();
         SlotGroup slotGroup = opt.slotGroup();
         int dayIndex = slotGroup.dayIndex();
+        Long[] roomAssignments = state.batchRoomAssignments.computeIfAbsent(b, k -> new Long[state.totalSlotCount]);
 
         BitSet batchBitSet = state.usedBatchSlots.computeIfAbsent(b, k -> new BitSet(state.totalSlotCount));
         BitSet teacherBitSet = state.usedTeacherSlots.computeIfAbsent(t, k -> new BitSet(state.totalSlotCount));
@@ -900,6 +936,7 @@ public class GenerationService {
             teacherBitSet.set(index);
             roomBitSet.set(index);
             currentDaySet.add(index);
+            roomAssignments[index] = r;
         }
 
         int length = slotGroup.length();
@@ -911,10 +948,6 @@ public class GenerationService {
         }
         setSubjectScheduledOnDay(b, task.getSubject().getId(), dayIndex, true, state);
 
-        if (task.getSessionType() != SessionType.PRACTICAL) {
-            bindNonPracticalRoom(b, r, state);
-        }
-
         bindSubjectTeacher(b, task.getSubject().getId(), t, state);
     }
 
@@ -925,6 +958,7 @@ public class GenerationService {
         Long r = opt.room().getId();
         SlotGroup slotGroup = opt.slotGroup();
         int dayIndex = slotGroup.dayIndex();
+        Long[] roomAssignments = state.batchRoomAssignments.get(b);
 
         BitSet batchBitSet = state.usedBatchSlots.get(b);
         BitSet teacherBitSet = state.usedTeacherSlots.get(t);
@@ -939,6 +973,9 @@ public class GenerationService {
             }
             if (roomBitSet != null) {
                 roomBitSet.clear(index);
+            }
+            if (roomAssignments != null) {
+                roomAssignments[index] = null;
             }
 
             NavigableSet<Integer>[] perDay = state.batchDaySlotIndexes.get(b);
@@ -989,11 +1026,6 @@ public class GenerationService {
         }
 
         setSubjectScheduledOnDay(b, task.getSubject().getId(), dayIndex, false, state);
-
-        if (task.getSessionType() != SessionType.PRACTICAL) {
-            unbindNonPracticalRoom(b, state);
-        }
-
         unbindSubjectTeacher(b, task.getSubject().getId(), state);
 
         cleanupBitSet(state.usedBatchSlots, b);
@@ -1466,13 +1498,8 @@ public class GenerationService {
             return cached == null ? List.of() : cached;
         }
 
-        Long fixedRoomId = state.nonPracticalRoomByBatch.get(task.getBatch().getId());
-        if (fixedRoomId == null) {
-            return precomputedSlots.nonLabRooms();
-        }
-
-        RoomEntity fixedRoom = precomputedSlots.nonLabRoomById().get(fixedRoomId);
-        return fixedRoom == null ? List.of() : List.of(fixedRoom);
+        // Always allow the algorithm to pick from any available non-lab room
+        return precomputedSlots.nonLabRooms();
     }
 
     private List<TeacherCandidate> resolveTeacherCandidates(SessionTask task, SchedulingState state) {
