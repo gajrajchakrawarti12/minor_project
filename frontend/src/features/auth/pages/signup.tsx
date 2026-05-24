@@ -5,8 +5,7 @@ import { Label } from "@/shared/components/ui/label";
 import { Alert, AlertDescription } from "@/shared/components/ui/alert";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import gradientBackgroundDark from "@/assets/images/gradient-background-dark.png";
-import gradientBackgroundLight from "@/assets/images/gradient-background-light.png";
+import AppBackground from "@/shared/components/AppBackground";
 import { type ApiError } from "@/shared/api/http";
 import { authContext } from "../authContext";
 
@@ -16,16 +15,13 @@ function Signup() {
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const navigate = useNavigate();
-    const isDarkMode = typeof document !== "undefined" && document.documentElement.classList.contains("dark");
-
     const handleSignup = async (e: React.FormEvent) => {
         e.preventDefault()
         setError(null)
         setIsLoading(true)
         
         try {
-            const response = await authContext.signup({ username, password })
-            console.log("Signup successful:", response)
+            await authContext.signup({ username, password })
             navigate("/login")
         } catch (err) {
             const apiError = err as ApiError
@@ -38,15 +34,7 @@ function Signup() {
     }
 
     return (
-        <div
-            className="min-h-screen flex items-center justify-center p-4"
-            style={{
-                backgroundImage: `url(${isDarkMode ? gradientBackgroundDark : gradientBackgroundLight})`,
-                backgroundSize: "cover",
-                backgroundPosition: "center",
-                backgroundRepeat: "no-repeat",
-            }}
-        >
+        <AppBackground className="flex items-center justify-center p-4">
             <div
                 className="absolute inset-0 opacity-0"
                 style={{
@@ -160,7 +148,7 @@ function Signup() {
                     </div>
                 </CardContent>
             </Card>
-        </div>
+        </AppBackground>
     )
 }
 

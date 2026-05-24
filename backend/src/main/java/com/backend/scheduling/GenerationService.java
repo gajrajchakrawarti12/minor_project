@@ -1,10 +1,21 @@
-package com.backend.models.autogeneration;
+package com.backend.scheduling;
 
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableSet;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.time.LocalTime;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -12,15 +23,23 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 
-import com.backend.exceptions.InvalidRequestException;
-import com.backend.models.batch.BatchRepository;
-import com.backend.models.room.RoomRepository;
-import com.backend.models.teacher.TeacherRepository;
-import com.backend.models.timeslots.TimeSlotRepository;
-import com.backend.models.timetable.TimetableAutoGenerateRequestModel;
-import com.backend.models.timetable.TimetableEntity;
-import com.backend.models.timetable.TimetableRepository;
-import com.backend.models.timetable.TimetableResponseModel;
+import com.backend.common.exception.InvalidRequestException;
+import com.backend.batch.BatchEntity;
+import com.backend.batch.BatchRepository;
+import com.backend.room.RoomEntity;
+import com.backend.room.RoomRepository;
+import com.backend.subject.SubjectEntity;
+import com.backend.teacher.TeacherEntity;
+import com.backend.teacher.TeacherRepository;
+import com.backend.timeslot.TimeSlotEntity;
+import com.backend.timeslot.TimeSlotRepository;
+import com.backend.timetable.TimetableAutoGenerateRequestModel;
+import com.backend.timetable.TimetableEntity;
+import com.backend.timetable.TimetableRepository;
+import com.backend.timetable.TimetableResponseModel;
+import com.backend.common.exception.TimetableGenerationTimeoutException;
+
+import static com.backend.scheduling.SchedulingConstants.*;
 
 @Service
 public class GenerationService {
@@ -40,37 +59,6 @@ public class GenerationService {
 
     @Value("${app.timetable.max-generation-ms:90000}")
     private long maxGenerationMs;
-
-    private static final int MAX_CLASSES_PER_DAY = 6;
-    private static final int MAX_RETRY_ATTEMPTS = 5;
-    private static final int MAX_BRANCHING_OPTIONS = 8;
-    private static final int MIN_BRANCHING_OPTIONS = 4;
-    private static final int FINAL_ATTEMPT_BRANCH_BOOST = 4;
-    private static final int MAX_FINAL_BRANCHING_OPTIONS = 14;
-    private static final long MAX_RECURSIVE_STATES_PER_ATTEMPT = 300_000L;
-    private static final int CHUNKED_GENERATION_THRESHOLD = 5;
-    private static final int SINGLE_BATCH_CHUNK_THRESHOLD = 8;
-    private static final int MEDIUM_BATCH_CHUNK_THRESHOLD = 6;
-    private static final int MAX_CHUNK_ORDER_ATTEMPTS = 6;
-    private static final List<Integer> PRACTICAL_SLOT_OPTIONS = List.of(3, 2, 1);
-
-    private static final int TEACHER_LOAD_WEIGHT = 10;
-    private static final int ROOM_LOAD_WEIGHT = 5;
-    private static final int DAY_LOAD_WEIGHT = 4;
-    private static final int FALLBACK_TEACHER_PENALTY = 20;
-    private static final int TEACHER_SWITCH_PENALTY = 150;
-    private static final int GAP_PENALTY_WEIGHT = 12;
-    private static final int INTERNAL_HOLE_PENALTY = 4;
-    private static final int SAME_SUBJECT_DAY_PENALTY = 1000;
-
-    private static final Map<String, Integer> DAY_ORDER = Map.of(
-            "MONDAY", 1,
-            "TUESDAY", 2,
-            "WEDNESDAY", 3,
-            "THURSDAY", 4,
-            "FRIDAY", 5,
-            "SATURDAY", 6,
-            "SUNDAY", 7);
 
     // ================= MAIN METHOD =================
 
@@ -286,12 +274,11 @@ public class GenerationService {
             throwGenerationTimeout();
         }
 
-        List<SessionTask> baseTasks = buildTasks(batches);
+        PrecomputedSlots precomputedSlots = initializeSlotPrecomputation(sortedSlots, rooms);
+        List<SessionTask> baseTasks = buildTasks(batches, precomputedSlots);
         if (baseTasks.isEmpty()) {
             return List.of();
         }
-
-        PrecomputedSlots precomputedSlots = initializeSlotPrecomputation(sortedSlots, rooms);
         validateDepartmentResourceFeasibility(baseTasks, precomputedSlots);
 
         Random seedRandom = new Random();
@@ -328,17 +315,19 @@ public class GenerationService {
 
     // ================= TASK BUILDER =================
 
-    private List<SessionTask> buildTasks(List<BatchEntity> batches) {
+    private List<SessionTask> buildTasks(List<BatchEntity> batches, PrecomputedSlots precomputedSlots) {
         List<SessionTask> tasks = new ArrayList<>();
+        Map<Long, List<TeacherEntity>> teachersBySubjectId = new HashMap<>();
+        Map<String, List<TeacherEntity>> fallbackTeachersByDepartments = new HashMap<>();
+        Map<Long, List<RoomEntity>> practicalRoomsByBatchSubject = new HashMap<>();
 
         for (BatchEntity batch : batches) {
             for (SubjectEntity subject : batch.getSubject()) {
                 Set<Long> allowedDepartmentIds = resolveAllowedDepartmentIds(batch, subject);
 
-                List<TeacherEntity> allSpecializedTeachers = teacherRepository
-                        .findDistinctBySpecializations_Id(subject.getId())
-                        .stream()
-                        .toList();
+                List<TeacherEntity> allSpecializedTeachers = teachersBySubjectId.computeIfAbsent(
+                        subject.getId(),
+                        subjectId -> teacherRepository.findDistinctBySpecializations_Id(subjectId));
 
                 List<TeacherEntity> specializedTeachers = allSpecializedTeachers.stream()
                         .filter(teacher -> belongsToAllowedDepartment(teacher, allowedDepartmentIds))
@@ -353,7 +342,10 @@ public class GenerationService {
                     } else {
                         // Last resort: allow same-department teachers if specialization data is
                         // missing.
-                        fallbackTeachers = findTeachersInAllowedDepartments(allowedDepartmentIds);
+                        String departmentKey = departmentCacheKey(allowedDepartmentIds);
+                        fallbackTeachers = fallbackTeachersByDepartments.computeIfAbsent(
+                                departmentKey,
+                                ignored -> findTeachersInAllowedDepartments(allowedDepartmentIds));
                         if (fallbackTeachers.isEmpty()) {
                             throw new InvalidRequestException(
                                     "No teacher available for subject '" + subject.getName()
@@ -363,14 +355,18 @@ public class GenerationService {
                 }
 
                 addTasks(tasks, batch, subject, SessionType.LECTURE, safe(subject.getLecture()), 0,
-                        specializedTeachers, fallbackTeachers, allowedDepartmentIds);
+                        specializedTeachers, fallbackTeachers, allowedDepartmentIds, null);
                 addTasks(tasks, batch, subject, SessionType.TUTORIAL, safe(subject.getTutorial()), 0,
-                        specializedTeachers, fallbackTeachers, allowedDepartmentIds);
+                        specializedTeachers, fallbackTeachers, allowedDepartmentIds, null);
 
                 PracticalPlan practicalPlan = buildPracticalPlan(safe(subject.getPractical()));
+                long practicalRoomKey = subjectMaskKey(batch.getId(), subject.getId());
+                List<RoomEntity> practicalRooms = practicalRoomsByBatchSubject.computeIfAbsent(
+                        practicalRoomKey,
+                        ignored -> resolvePracticalRooms(batch, allowedDepartmentIds, precomputedSlots));
                 for (int slotLength : practicalPlan.slotLengths()) {
                     addTasks(tasks, batch, subject, SessionType.PRACTICAL, 1, slotLength,
-                            specializedTeachers, fallbackTeachers, allowedDepartmentIds);
+                            specializedTeachers, fallbackTeachers, allowedDepartmentIds, practicalRooms);
                 }
             }
         }
@@ -387,12 +383,29 @@ public class GenerationService {
             int practicalSlotLength,
             List<TeacherEntity> specializedTeachers,
             List<TeacherEntity> fallbackTeachers,
-            Set<Long> allowedDepartmentIds) {
+            Set<Long> allowedDepartmentIds,
+            List<RoomEntity> practicalRooms) {
 
         for (int i = 0; i < count; i++) {
             tasks.add(new SessionTask(batch, subject, type, specializedTeachers, fallbackTeachers, practicalSlotLength,
-                    allowedDepartmentIds));
+                    allowedDepartmentIds, practicalRooms));
         }
+    }
+
+    private String departmentCacheKey(Set<Long> allowedDepartmentIds) {
+        if (allowedDepartmentIds.isEmpty()) {
+            return "";
+        }
+        List<Long> sorted = new ArrayList<>(allowedDepartmentIds);
+        Collections.sort(sorted);
+        StringBuilder builder = new StringBuilder(sorted.size() * 4);
+        for (int i = 0; i < sorted.size(); i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append(sorted.get(i));
+        }
+        return builder.toString();
     }
 
     private int safe(Integer v) {
@@ -429,7 +442,7 @@ public class GenerationService {
         }
 
         int selectedIndex = -1;
-        List<AssignmentOption> selectedOptions = List.of();
+        int selectedOptionCount = Integer.MAX_VALUE;
         int selectedTeacherPoolSize = Integer.MAX_VALUE;
         int branchLimit = computeBranchLimit(depth, tasks.size(), exhaustiveAttempt);
 
@@ -439,32 +452,42 @@ public class GenerationService {
             }
 
             SessionTask candidateTask = tasks.get(i);
-            List<AssignmentOption> candidateOptions = getAllPossibleAssignments(
+            int candidateCount = countAssignableOptions(
                     candidateTask,
                     state,
                     precomputedSlots,
-                    branchLimit,
+                    selectedOptionCount,
                     deadlineNanos);
 
-            if (candidateOptions.isEmpty()) {
+            if (candidateCount == 0) {
                 return false;
             }
 
             if (selectedIndex == -1 ||
-                    candidateOptions.size() < selectedOptions.size() ||
-                    (candidateOptions.size() == selectedOptions.size() &&
+                    candidateCount < selectedOptionCount ||
+                    (candidateCount == selectedOptionCount &&
                             candidateTask.teacherPoolSize() < selectedTeacherPoolSize)
                     ||
-                    (candidateOptions.size() == selectedOptions.size() &&
+                    (candidateCount == selectedOptionCount &&
                             candidateTask.teacherPoolSize() == selectedTeacherPoolSize &&
                             random.nextBoolean())) {
                 selectedIndex = i;
-                selectedOptions = candidateOptions;
+                selectedOptionCount = candidateCount;
                 selectedTeacherPoolSize = candidateTask.teacherPoolSize();
             }
         }
 
         SessionTask task = tasks.remove(selectedIndex);
+        List<AssignmentOption> selectedOptions = getAllPossibleAssignments(
+                task,
+                state,
+                precomputedSlots,
+                branchLimit,
+                deadlineNanos);
+        if (selectedOptions.isEmpty()) {
+            tasks.add(selectedIndex, task);
+            return false;
+        }
 
         for (AssignmentOption option : selectedOptions) {
             if (shouldStop(deadlineNanos)) {
@@ -491,6 +514,88 @@ public class GenerationService {
 
     // ================= OPTIONS =================
 
+    private int countAssignableOptions(
+            SessionTask task,
+            SchedulingState state,
+            PrecomputedSlots precomputedSlots,
+            int stopAfter,
+            long deadlineNanos) {
+
+        if (shouldStop(deadlineNanos)) {
+            return 0;
+        }
+
+        int count = 0;
+        Long batchId = task.getBatch().getId();
+        List<RoomEntity> roomPool = resolveRoomPool(task, state, precomputedSlots);
+        List<TeacherCandidate> teacherCandidates = resolveTeacherCandidates(task, state);
+
+        if (roomPool.isEmpty()) {
+            return 0;
+        }
+
+        BitSet batchBits = state.usedBatchSlots.get(batchId);
+
+        for (Long startSlotId : precomputedSlots.startSlotIds()) {
+            if (shouldStop(deadlineNanos)) {
+                return 0;
+            }
+
+            List<SlotGroup> candidateSlotGroups = findConsecutiveSlots(task, startSlotId, precomputedSlots);
+            if (candidateSlotGroups.isEmpty()) {
+                continue;
+            }
+
+            if (batchBits != null && isStartSlotBlocked(batchBits, candidateSlotGroups.get(0))) {
+                continue;
+            }
+
+            List<SlotGroup> batchAssignableSlotGroups = filterBatchAssignableSlotGroups(
+                    task,
+                    batchId,
+                    candidateSlotGroups,
+                    state);
+            if (batchAssignableSlotGroups.isEmpty()) {
+                continue;
+            }
+
+            for (TeacherCandidate candidate : teacherCandidates) {
+                if (shouldStop(deadlineNanos)) {
+                    return 0;
+                }
+
+                TeacherEntity teacher = candidate.teacher();
+                BitSet teacherBits = state.usedTeacherSlots.get(teacher.getId());
+
+                for (RoomEntity room : roomPool) {
+                    if (shouldStop(deadlineNanos)) {
+                        return 0;
+                    }
+
+                    BitSet roomBits = state.usedRoomSlots.get(room.getId());
+
+                    for (SlotGroup slotGroup : batchAssignableSlotGroups) {
+                        if (shouldStop(deadlineNanos)) {
+                            return 0;
+                        }
+
+                        if (!isSlotGroupFree(batchId, teacher, room, slotGroup, state, task, batchBits, teacherBits,
+                                roomBits)) {
+                            continue;
+                        }
+
+                        count++;
+                        if (count >= stopAfter) {
+                            return count;
+                        }
+                    }
+                }
+            }
+        }
+
+        return count;
+    }
+
     private List<AssignmentOption> getAllPossibleAssignments(
             SessionTask task,
             SchedulingState state,
@@ -505,11 +610,13 @@ public class GenerationService {
         List<AssignmentOption> bestOptions = new ArrayList<>(branchLimit);
         Long batchId = task.getBatch().getId();
         List<RoomEntity> roomPool = resolveRoomPool(task, state, precomputedSlots);
-        List<TeacherCandidate> teacherCandidates = resolveTeacherCandidates(task, state);
+        List<TeacherCandidate> teacherCandidates = orderTeacherCandidates(resolveTeacherCandidates(task, state), state);
 
         if (roomPool.isEmpty()) {
             return List.of();
         }
+
+        BitSet batchBits = state.usedBatchSlots.get(batchId);
 
         for (Long startSlotId : precomputedSlots.startSlotIds()) {
             if (shouldStop(deadlineNanos)) {
@@ -518,6 +625,10 @@ public class GenerationService {
 
             List<SlotGroup> candidateSlotGroups = findConsecutiveSlots(task, startSlotId, precomputedSlots);
             if (candidateSlotGroups.isEmpty()) {
+                continue;
+            }
+
+            if (batchBits != null && isStartSlotBlocked(batchBits, candidateSlotGroups.get(0))) {
                 continue;
             }
 
@@ -536,18 +647,22 @@ public class GenerationService {
                 }
 
                 TeacherEntity teacher = candidate.teacher();
+                BitSet teacherBits = state.usedTeacherSlots.get(teacher.getId());
 
                 for (RoomEntity room : roomPool) {
                     if (shouldStop(deadlineNanos)) {
                         return List.of();
                     }
 
+                    BitSet roomBits = state.usedRoomSlots.get(room.getId());
+
                     for (SlotGroup slotGroup : batchAssignableSlotGroups) {
                         if (shouldStop(deadlineNanos)) {
                             return List.of();
                         }
 
-                        if (!isSlotGroupAssignable(batchId, teacher, room, slotGroup, state, task)) {
+                        if (!isSlotGroupFree(batchId, teacher, room, slotGroup, state, task, batchBits, teacherBits,
+                                roomBits)) {
                             continue;
                         }
 
@@ -569,26 +684,54 @@ public class GenerationService {
             PrecomputedSlots precomputedSlots) {
 
         if (task.getSessionType() == SessionType.PRACTICAL) {
-            List<SlotGroup> groups = precomputedSlots.practicalGroupsByStartSlotId().getOrDefault(startSlotId,
-                    List.of());
-            if (groups.isEmpty()) {
-                return groups;
-            }
-
             int requiredLength = task.getPracticalSlotLength();
             if (requiredLength <= 0) {
-                return groups;
+                return precomputedSlots.practicalGroupsByStartSlotId().getOrDefault(startSlotId, List.of());
             }
-
-            List<SlotGroup> filtered = new ArrayList<>(1);
-            for (SlotGroup group : groups) {
-                if (group.length() == requiredLength) {
-                    filtered.add(group);
-                }
-            }
-            return filtered;
+            Map<Integer, List<SlotGroup>> byLength = precomputedSlots.practicalGroupsByStartSlotAndLength()
+                    .getOrDefault(startSlotId, Map.of());
+            return byLength.getOrDefault(requiredLength, List.of());
         }
         return precomputedSlots.singleSlotGroupsByStartSlotId().getOrDefault(startSlotId, List.of());
+    }
+
+    private boolean isStartSlotBlocked(BitSet batchBits, SlotGroup slotGroup) {
+        int[] slotIndexes = slotGroup.slotIndexes();
+        return slotIndexes.length > 0 && batchBits.get(slotIndexes[0]);
+    }
+
+    private boolean isSlotGroupFree(
+            Long batchId,
+            TeacherEntity teacher,
+            RoomEntity room,
+            SlotGroup slotGroup,
+            SchedulingState state,
+            SessionTask task,
+            BitSet batchBits,
+            BitSet teacherBits,
+            BitSet roomBits) {
+
+        if (task.getSessionType() != SessionType.PRACTICAL) {
+            Long fixedRoomId = state.nonPracticalRoomByBatch.get(batchId);
+            if (fixedRoomId != null && !fixedRoomId.equals(room.getId())) {
+                return false;
+            }
+        }
+
+        int[] slotIndexes = slotGroup.slotIndexes();
+        for (int slotIndex : slotIndexes) {
+            if (batchBits != null && batchBits.get(slotIndex)) {
+                return false;
+            }
+            if (teacherBits != null && teacherBits.get(slotIndex)) {
+                return false;
+            }
+            if (roomBits != null && roomBits.get(slotIndex)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private boolean isConsecutiveBlock(List<TimeSlotEntity> slots) {
@@ -608,41 +751,6 @@ public class GenerationService {
             LocalTime prevEnd = prev.getEndTime();
             LocalTime currStart = curr.getStartTime();
             if (prevEnd == null || currStart == null || !prevEnd.equals(currStart)) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private boolean isSlotGroupAssignable(
-            Long batchId,
-            TeacherEntity teacher,
-            RoomEntity room,
-            SlotGroup slotGroup,
-            SchedulingState state,
-            SessionTask task) {
-
-        if (task.getSessionType() != SessionType.PRACTICAL) {
-            Long fixedRoomId = state.nonPracticalRoomByBatch.get(batchId);
-            if (fixedRoomId != null && !fixedRoomId.equals(room.getId())) {
-                return false;
-            }
-        }
-
-        int[] slotIndexes = slotGroup.slotIndexes();
-        BitSet batchBits = state.usedBatchSlots.get(batchId);
-        BitSet teacherBits = state.usedTeacherSlots.get(teacher.getId());
-        BitSet roomBits = state.usedRoomSlots.get(room.getId());
-
-        for (int slotIndex : slotIndexes) {
-            if (batchBits != null && batchBits.get(slotIndex)) {
-                return false;
-            }
-            if (teacherBits != null && teacherBits.get(slotIndex)) {
-                return false;
-            }
-            if (roomBits != null && roomBits.get(slotIndex)) {
                 return false;
             }
         }
@@ -908,9 +1016,14 @@ public class GenerationService {
                 remainingPracticalBlocksByBatch.merge(batchId, 1, Integer::sum);
             }
 
-            List<TeacherCandidate> candidates = resolveTeacherCandidates(task, state);
-            if (candidates.size() == 1) {
-                mandatoryRequiredSlotsByTeacher.merge(candidates.get(0).teacher().getId(), minRequiredSlots,
+            Long boundTeacherId = state.subjectTeacherByBatchSubject
+                    .get(subjectMaskKey(batchId, task.getSubject().getId()));
+            if (boundTeacherId != null) {
+                mandatoryRequiredSlotsByTeacher.merge(boundTeacherId, minRequiredSlots, Integer::sum);
+            } else if (task.getTeacherCandidates().size() == 1) {
+                mandatoryRequiredSlotsByTeacher.merge(
+                        task.getTeacherCandidates().get(0).teacher().getId(),
+                        minRequiredSlots,
                         Integer::sum);
             }
         }
@@ -1109,6 +1222,7 @@ public class GenerationService {
         Map<Long, Integer> slotIndexById = buildSlotIndex(sortedSlots);
         Map<Long, List<SlotGroup>> singleGroupsByStartSlot = new HashMap<>();
         Map<Long, List<SlotGroup>> practicalGroupsByStartSlot = new HashMap<>();
+        Map<Long, Map<Integer, List<SlotGroup>>> practicalGroupsByStartSlotAndLength = new HashMap<>();
         List<Long> startSlotIds = new ArrayList<>(sortedSlots.size());
 
         for (int i = 0; i < sortedSlots.size(); i++) {
@@ -1119,6 +1233,7 @@ public class GenerationService {
             if (dayIndex < 0) {
                 singleGroupsByStartSlot.put(startSlot.getId(), List.of());
                 practicalGroupsByStartSlot.put(startSlot.getId(), List.of());
+                practicalGroupsByStartSlotAndLength.put(startSlot.getId(), Map.of());
                 continue;
             }
 
@@ -1145,12 +1260,23 @@ public class GenerationService {
             practicalGroupsByStartSlot.put(
                     startSlot.getId(),
                     practicalGroups.isEmpty() ? List.of() : List.copyOf(practicalGroups));
+
+            Map<Integer, List<SlotGroup>> groupsByLength = new HashMap<>();
+            for (SlotGroup group : practicalGroups) {
+                groupsByLength.computeIfAbsent(group.length(), ignored -> new ArrayList<>()).add(group);
+            }
+            Map<Integer, List<SlotGroup>> immutableByLength = new HashMap<>();
+            for (Map.Entry<Integer, List<SlotGroup>> entry : groupsByLength.entrySet()) {
+                immutableByLength.put(entry.getKey(), List.copyOf(entry.getValue()));
+            }
+            practicalGroupsByStartSlotAndLength.put(startSlot.getId(), Map.copyOf(immutableByLength));
         }
 
         return new PrecomputedSlots(
                 slotIndexById,
                 singleGroupsByStartSlot,
                 practicalGroupsByStartSlot,
+                practicalGroupsByStartSlotAndLength,
                 List.copyOf(startSlotIds),
                 buildLabRoomsCache(rooms),
                 buildNonLabRoomsCache(rooms),
@@ -1289,7 +1415,8 @@ public class GenerationService {
                 continue;
             }
 
-            if (getDepartmentalLabs(task, precomputedSlots).isEmpty()) {
+            List<RoomEntity> practicalRooms = task.getCachedPracticalRooms();
+            if (practicalRooms == null || practicalRooms.isEmpty()) {
                 throw new InvalidRequestException(
                         "No laboratory available for practical subject '"
                                 + task.getSubject().getName() + "'. Please add labs for this subject's department.");
@@ -1297,7 +1424,11 @@ public class GenerationService {
         }
     }
 
-    private List<RoomEntity> getDepartmentalLabs(SessionTask task, PrecomputedSlots precomputedSlots) {
+    private List<RoomEntity> resolvePracticalRooms(
+            BatchEntity batch,
+            Set<Long> allowedDepartmentIds,
+            PrecomputedSlots precomputedSlots) {
+
         List<RoomEntity> departmentSpecificLabs = new ArrayList<>();
         List<RoomEntity> commonLabs = new ArrayList<>();
 
@@ -1308,13 +1439,13 @@ public class GenerationService {
                 continue;
             }
             // Department-specific labs
-            if (task.getAllowedDepartmentIds().contains(room.getDepartment().getId())) {
+            if (allowedDepartmentIds.contains(room.getDepartment().getId())) {
                 departmentSpecificLabs.add(room);
             }
         }
 
         // First-year (semester 1 & 2) students: Prioritize common labs
-        int semester = task.getBatch().getSemester();
+        int semester = batch.getSemester();
         if (semester <= 2) {
             // For first-year: common labs first, then department-specific
             List<RoomEntity> result = new ArrayList<>(commonLabs);
@@ -1331,7 +1462,8 @@ public class GenerationService {
     private List<RoomEntity> resolveRoomPool(SessionTask task, SchedulingState state,
             PrecomputedSlots precomputedSlots) {
         if (task.getSessionType() == SessionType.PRACTICAL) {
-            return getDepartmentalLabs(task, precomputedSlots);
+            List<RoomEntity> cached = task.getCachedPracticalRooms();
+            return cached == null ? List.of() : cached;
         }
 
         Long fixedRoomId = state.nonPracticalRoomByBatch.get(task.getBatch().getId());
@@ -1354,6 +1486,17 @@ public class GenerationService {
                     return List.of(candidate);
                 }
             }
+        }
+
+        return candidates;
+    }
+
+    private List<TeacherCandidate> orderTeacherCandidates(
+            List<TeacherCandidate> candidates,
+            SchedulingState state) {
+
+        if (candidates.size() <= 1) {
+            return candidates;
         }
 
         List<TeacherCandidate> ordered = new ArrayList<>(candidates);
@@ -1535,7 +1678,7 @@ public class GenerationService {
     private void throwGenerationTimeout() {
         throw new TimetableGenerationTimeoutException(
                 "Timetable generation exceeded the configured time limit of " + maxGenerationMs
-                        + " ms. Try fewer batches or increase TIMETABLE_MAX_GENERATION_MS.");
+                        + " ms. Try fewer batches or increase APP_TIMETABLE_MAX_GENERATION_MS.");
     }
 
     @SuppressWarnings("unchecked")
@@ -1559,157 +1702,6 @@ public class GenerationService {
             }
         }
         return true;
-    }
-
-    // ================= MODELS =================
-
-    private record AssignmentOption(
-            TeacherEntity teacher,
-            RoomEntity room,
-            SlotGroup slotGroup,
-            int score,
-            boolean usesFallbackTeacher) {
-    }
-
-    private record SlotGroup(
-            List<TimeSlotEntity> slots,
-            int[] slotIndexes,
-            int dayIndex,
-            int length) {
-    }
-
-    private record PracticalPlan(int sessionCount, List<Integer> slotLengths) {
-    }
-
-    private record TeacherCandidate(TeacherEntity teacher, boolean fallback) {
-    }
-
-    private record SlotPair(Long left, Long right) {
-    }
-
-    private static class SearchBudget {
-        private final long maxStates;
-        private long visitedStates;
-
-        private SearchBudget(long maxStates) {
-            this.maxStates = maxStates;
-        }
-
-        private boolean tryVisit() {
-            if (visitedStates >= maxStates) {
-                return false;
-            }
-
-            visitedStates++;
-            return true;
-        }
-    }
-
-    private record PrecomputedSlots(
-            Map<Long, Integer> slotIndexById,
-            Map<Long, List<SlotGroup>> singleSlotGroupsByStartSlotId,
-            Map<Long, List<SlotGroup>> practicalGroupsByStartSlotId,
-            List<Long> startSlotIds,
-            List<RoomEntity> labRooms,
-            List<RoomEntity> nonLabRooms,
-            Map<Long, RoomEntity> nonLabRoomById) {
-    }
-
-    private enum SessionType {
-        LECTURE,
-        TUTORIAL,
-        PRACTICAL
-    }
-
-    private static class SchedulingState {
-        private final Map<Long, Integer> slotIndexById;
-        private final int totalSlotCount;
-        private final Map<Long, BitSet> usedBatchSlots = new HashMap<>();
-        private final Map<Long, BitSet> usedTeacherSlots = new HashMap<>();
-        private final Map<Long, BitSet> usedRoomSlots = new HashMap<>();
-        private final Map<Long, Integer> teacherLoad = new HashMap<>();
-        private final Map<Long, Integer> roomLoad = new HashMap<>();
-        private final Map<Long, int[]> batchDayLoad = new HashMap<>();
-        private final Map<Long, int[]> batchPracticalDayLoad = new HashMap<>();
-        private final Map<Long, Byte> subjectPerDayMask = new HashMap<>();
-        private final Map<Long, NavigableSet<Integer>[]> batchDaySlotIndexes = new HashMap<>();
-        private final Map<Long, Long> nonPracticalRoomByBatch = new HashMap<>();
-        private final Map<Long, Integer> nonPracticalRoomUsageCountByBatch = new HashMap<>();
-        private final Map<Long, Long> subjectTeacherByBatchSubject = new HashMap<>();
-        private final Map<Long, Integer> subjectTeacherUsageCount = new HashMap<>();
-
-        private SchedulingState(Map<Long, Integer> slotIndexById, int totalSlotCount) {
-            this.slotIndexById = slotIndexById;
-            this.totalSlotCount = totalSlotCount;
-        }
-    }
-
-    private static class SessionTask {
-        private final BatchEntity batch;
-        private final SubjectEntity subject;
-        private final SessionType sessionType;
-        private final List<TeacherCandidate> teacherCandidates;
-        private final int practicalSlotLength;
-        private final Set<Long> allowedDepartmentIds;
-
-        public SessionTask(
-                BatchEntity batch,
-                SubjectEntity subject,
-                SessionType sessionType,
-                List<TeacherEntity> specializedTeachers,
-                List<TeacherEntity> fallbackTeachers,
-                int practicalSlotLength,
-                Set<Long> allowedDepartmentIds) {
-            this.batch = batch;
-            this.subject = subject;
-            this.sessionType = sessionType;
-            this.practicalSlotLength = practicalSlotLength;
-            this.allowedDepartmentIds = Set.copyOf(allowedDepartmentIds);
-
-            List<TeacherCandidate> candidates = new ArrayList<>();
-            for (TeacherEntity teacher : specializedTeachers) {
-                candidates.add(new TeacherCandidate(teacher, false));
-            }
-            for (TeacherEntity teacher : fallbackTeachers) {
-                candidates.add(new TeacherCandidate(teacher, true));
-            }
-            this.teacherCandidates = candidates;
-        }
-
-        public BatchEntity getBatch() {
-            return batch;
-        }
-
-        public SubjectEntity getSubject() {
-            return subject;
-        }
-
-        public SessionType getSessionType() {
-            return sessionType;
-        }
-
-        public List<TeacherCandidate> getTeacherCandidates() {
-            return teacherCandidates;
-        }
-
-        public int getPracticalSlotLength() {
-            return practicalSlotLength;
-        }
-
-        public Set<Long> getAllowedDepartmentIds() {
-            return allowedDepartmentIds;
-        }
-
-        public int teacherPoolSize() {
-            return teacherCandidates.size();
-        }
-
-        public int minRequiredSlots() {
-            if (sessionType != SessionType.PRACTICAL) {
-                return 1;
-            }
-            return practicalSlotLength > 0 ? practicalSlotLength : 2;
-        }
     }
 
     private TimetableResponseModel toResponse(TimetableEntity e) {
