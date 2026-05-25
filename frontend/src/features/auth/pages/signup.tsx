@@ -1,13 +1,7 @@
-import { Button } from "@/shared/components/ui/button";
-import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/shared/components/ui/card";
-import { Input } from "@/shared/components/ui/input";
-import { Label } from "@/shared/components/ui/label";
-import { Alert, AlertDescription } from "@/shared/components/ui/alert";
-import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import AppBackground from "@/shared/components/AppBackground";
-import { type ApiError } from "@/shared/api/http";
-import { authContext } from "../authContext";
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { authContext } from "@/features/auth/authContext";
+import type { ApiError } from "@/shared/api/http";
 
 function Signup() {
     const [username, setUsername] = useState("");
@@ -15,6 +9,26 @@ function Signup() {
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const navigate = useNavigate();
+
+    useEffect(() => {
+        if (!authContext) return;
+        
+        const checkAuth = async () => {
+            if (await authContext.isAuthenticated()) {
+                navigate("/");
+            }
+        }
+        checkAuth();
+    }, [navigate]);
+
+    if (!authContext) {
+        return (
+            <div className="w-full h-[calc(100vh-5rem)] flex items-center justify-center">
+                <p className="text-red-500 text-xl">Authentication context is not available. Please try again later.</p>
+            </div>
+        );
+    }
+
     const handleSignup = async (e: React.FormEvent) => {
         e.preventDefault()
         setError(null)
@@ -33,123 +47,45 @@ function Signup() {
         }
     }
 
-    return (
-        <AppBackground className="flex items-center justify-center p-4">
-            <div
-                className="absolute inset-0 opacity-0"
-                style={{
-                    background: "rgba(0, 0, 0, 0.15)",
-                }}
-            ></div>
-
-            {/* Floating glass orbs for visual interest */}
-            <div className="absolute inset-0 overflow-hidden pointer-events-none">
-                <div
-                    className="absolute top-1/4 left-1/4 w-32 h-32 rounded-full opacity-50 animate-pulse"
-                    style={{
-                        background: "rgba(255, 255, 255, 0.15)",
-                        backdropFilter: "blur(20px) saturate(180%)",
-                        border: "2px solid rgba(255, 255, 255, 0.3)",
-                        boxShadow: "0 8px 32px rgba(255, 255, 255, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.4)",
-                    }}
-                ></div>
-                <div
-                    className="absolute top-3/4 right-1/4 w-24 h-24 rounded-full opacity-40 animate-pulse delay-1000"
-                    style={{
-                        background: "rgba(255, 255, 255, 0.15)",
-                        backdropFilter: "blur(20px) saturate(180%)",
-                        border: "2px solid rgba(255, 255, 255, 0.3)",
-                        boxShadow: "0 8px 32px rgba(255, 255, 255, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.4)",
-                    }}
-                ></div>
-                <div
-                    className="absolute top-1/2 right-1/3 w-16 h-16 rounded-full opacity-45 animate-pulse delay-500"
-                    style={{
-                        background: "rgba(255, 255, 255, 0.15)",
-                        backdropFilter: "blur(20px) saturate(180%)",
-                        border: "2px solid rgba(255, 255, 255, 0.3)",
-                        boxShadow: "0 8px 32px rgba(255, 255, 255, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.4)",
-                    }}
-                ></div>
-            </div>
-
-            <Card
-                className="max-w-md hover-lift shadow-2xl relative z-10 opacity-100 w-[126%] mx-[0] border-transparent"
-                style={{
-                    background: "rgba(255, 255, 255, 0.25)",
-                    backdropFilter: "blur(40px) saturate(250%)",
-                    border: "1px solid rgba(255, 255, 255, 0.4)",
-                    boxShadow:
-                        "0 32px 80px rgba(0, 0, 0, 0.3), 0 16px 64px rgba(255, 255, 255, 0.2), inset 0 3px 0 rgba(255, 255, 255, 0.6), inset 0 -1px 0 rgba(255, 255, 255, 0.3)",
-                }}
-            >
-                <CardHeader className="text-center space-y-2">
-                    <CardTitle className="text-3xl font-bold font-sans text-card-foreground">Create Account</CardTitle>
-                    <CardDescription className="text-card-foreground/70 font-sans">
-                        Sign up to create your account
-                    </CardDescription>
-                </CardHeader>
-
-                <CardContent className="space-y-6">
-                    {error && (
-                        <Alert variant="destructive">
-                            <AlertDescription>{error}</AlertDescription>
-                        </Alert>
-                    )}
-                    <form onSubmit={handleSignup} className="space-y-4">
-                        <div className="space-y-2">
-                            <Label htmlFor="username" className="text-sm font-medium text-card-foreground font-sans">
-                                Username
-                            </Label>
-                            <Input
-                                id="username"
-                                type="text"
-                                placeholder="Enter your username"
-                                value={username}
-                                onChange={(e) => setUsername(e.target.value)}
-                                className="border-white/40 bg-white/10 placeholder:text-card-foreground/50 text-card-foreground py-3 focus:ring-2 focus:ring-blue-400 focus:border-blue-400 focus:bg-white/15 transition-all duration-200"
-                                required
-                            />
-                        </div>
-
-                        <div className="space-y-2">
-                            <Label htmlFor="password" className="text-sm font-medium text-card-foreground font-sans">
-                                Password
-                            </Label>
-                            <Input
-                                id="password"
-                                type="password"
-                                placeholder="Enter your password"
-                                value={password}
-                                onChange={(e) => setPassword(e.target.value)}
-                                className="border-white/40 bg-white/10 placeholder:text-card-foreground/50 text-card-foreground py-3 focus:ring-2 focus:ring-blue-400 focus:border-blue-400 focus:bg-white/15 transition-all duration-200"
-                                required
-                            />
-                        </div>
-
-                        <Button
-                            type="submit"
-                            className="w-full ripple-effect hover-lift font-sans font-bold py-5 transition-all duration-300"
-                            style={{ backgroundColor: "#0C115B", color: "white" }}
-                            disabled={isLoading}
-                        >
-                            {isLoading ? "Signing Up..." : "Sign Up"}
-                        </Button>
-                    </form>
-
-                    <div className="text-center text-sm text-card-foreground/80 font-sans">
-                        Already have an account? {" "}
-                        <Link
-                            to="/login"
-                            className="font-semibold text-card-foreground hover:underline"
-                        >
-                            Sign in
-                        </Link>
-                    </div>
-                </CardContent>
-            </Card>
-        </AppBackground>
-    )
+  return (
+    <div className="w-full h-[calc(100vh-5rem)] flex items-center justify-center">
+      <div className="w-full max-w-md p-4 border shadow-lg">
+        <h1 className="text-3xl font-bold mb-8">Signup Page</h1>
+        <form onSubmit={handleSignup}>
+          <div className="mb-4 flex flex-row gap-2 items-center">
+            <label htmlFor="username">
+              Username:
+            </label>
+            <input
+              type="text"
+              id="username"
+              value={username}
+              className="p-2 border  flex-1"
+              required
+              onChange={(e) => setUsername(e.target.value)}
+            />
+          </div>
+          <div className="mb-4 flex flex-row gap-2 items-center">
+            <label htmlFor="password" className="flex">
+              Password:
+            </label>
+            <input
+              type="password"
+              id="password"
+              value={password}
+              required
+              className="p-2 border  flex-1"
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+          <button type="submit" disabled={isLoading} className="w-full bg-green-500 text-white font-bold text-xl p-2  disabled:bg-gray-400">
+            {isLoading ? "Signing up..." : "Signup"}
+          </button>
+        </form>
+        {error && <p style={{ color: "red" }}>{error}</p>}
+      </div>
+    </div>
+  )
 }
 
-export default Signup
+export default Signup;

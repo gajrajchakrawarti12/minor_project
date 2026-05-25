@@ -4,6 +4,7 @@ import java.util.Arrays;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.AuthenticationProvider;
 import org.springframework.security.authentication.dao.DaoAuthenticationProvider;
@@ -36,6 +37,12 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                     .requestMatchers("/api/auth/signup", "/api/auth/login", "/api/auth/logout", "/error")
                         .permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/timetables/**").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/teachers/**").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/rooms/**").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/subjects/**").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/batches/**").permitAll()
+
                         .anyRequest().authenticated())
                 .sessionManagement(customizer -> customizer.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .cors(customizer -> customizer.configurationSource(request -> {

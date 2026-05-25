@@ -1,14 +1,22 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
-import { Plus } from "lucide-react";
-import { PageContainer } from "@/shared/components/PageContainer";
-import { StatusAlerts } from "@/shared/components/StatusAlerts";
-import { DepartmentPicker } from "@/shared/components/DepartmentPicker";
-import { Card, CardContent, CardHeader, CardTitle } from "@/shared/components/ui/card";
-import { Input } from "@/shared/components/ui/input";
-import { Button } from "@/shared/components/ui/button";
-import { listDepartments, type Department } from "@/features/departments/api/departmentApi";
-import { listSubjects, type Subject } from "@/features/subjects/api/subjectApi";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import {
+  AlertCircle,
+  CheckCircle,
+  Plus,
+  Trash2,
+} from "lucide-react";
+
+import {
+  listDepartments,
+  type Department,
+} from "@/features/departments/api/departmentApi";
+
+import {
+  listSubjects,
+  type Subject,
+} from "@/features/subjects/api/subjectApi";
+
 import {
   createBatch,
   deleteBatch,
@@ -16,7 +24,9 @@ import {
   updateBatch,
   type Batch,
 } from "@/features/batches/api/batchApi";
+
 import { resolveApiErrorMessage } from "@/shared/lib/apiErrors";
+import { authContext } from "../auth/authContext";
 
 type BatchFormState = {
   name: string;
@@ -30,146 +40,242 @@ const initialBatchForm: BatchFormState = {
   subjectIds: [],
 };
 
-function BatchesPage() {
-  const [searchParams, setSearchParams] = useSearchParams();
-  const [departments, setDepartments] = useState<Department[]>([]);
-  const [subjects, setSubjects] = useState<Subject[]>([]);
-  const [batches, setBatches] = useState<Batch[]>([]);
-  const [selectedDepartmentId, setSelectedDepartmentId] = useState<number | null>(null);
-  const [selectedBatchId, setSelectedBatchId] = useState<number | null>(null);
-  const [formState, setFormState] = useState<BatchFormState>(initialBatchForm);
-  const [batchSearchQuery, setBatchSearchQuery] = useState("");
-  const [isLoadingDepartments, setIsLoadingDepartments] = useState(false);
-  const [isLoadingBatches, setIsLoadingBatches] = useState(false);
+function Batches() {
+
+  useEffect(() => {
+    if(!authContext) {
+        window.location.replace("/");
+        return;
+    };
+
+    const checkAuth = async () => {
+      if (!(await authContext.isAuthenticated())) {
+        window.location.replace("/");
+      }
+    };
+    checkAuth();
+  });
+
+  const [searchParams, setSearchParams] =
+    useSearchParams();
+
+  const departmentParam =
+    searchParams.get("departmentId");
+
+  const [departments, setDepartments] = useState<
+    Department[]
+  >([]);
+
+  const [subjects, setSubjects] = useState<Subject[]>(
+    []
+  );
+
+  const [batches, setBatches] = useState<Batch[]>(
+    []
+  );
+
+  const [selectedDepartmentId, setSelectedDepartmentId] =
+    useState<number | null>(null);
+
+  const [selectedBatchId, setSelectedBatchId] =
+    useState<number | null>(null);
+
+  const [formState, setFormState] =
+    useState<BatchFormState>(initialBatchForm);
+
+  const [batchSearchQuery, setBatchSearchQuery] =
+    useState("");
+
+  const [isLoading, setIsLoading] = useState(false);
+
   const [isSaving, setIsSaving] = useState(false);
-  const [deletingBatchId, setDeletingBatchId] = useState<number | null>(null);
-  const [isEditing, setIsEditing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
-  const selectedDepartment = useMemo(
-    () => departments.find((d) => d.id === selectedDepartmentId) ?? null,
-    [departments, selectedDepartmentId],
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  const [error, setError] = useState<string | null>(
+    null
   );
 
-  const batchesInDepartment = useMemo(
-    () => batches.filter((b) => b.department_id === selectedDepartmentId),
-    [batches, selectedDepartmentId],
-  );
+  const [successMessage, setSuccessMessage] =
+    useState<string | null>(null);
+
+  const selectedDepartment =
+    departments.find(
+      (department) =>
+        department.id === selectedDepartmentId
+    ) ?? null;
+
+  const selectedBatch =
+    batches.find(
+      (batch) => batch.id === selectedBatchId
+    ) ?? null;
+
+  const batchesInDepartment = useMemo(() => {
+    return batches.filter(
+      (batch) =>
+        batch.department_id === selectedDepartmentId
+    );
+  }, [batches, selectedDepartmentId]);
 
   const filteredBatches = useMemo(() => {
-    const query = batchSearchQuery.trim().toLowerCase();
+    const query = batchSearchQuery
+      .trim()
+      .toLowerCase();
+
     if (!query) {
       return batchesInDepartment;
     }
-    return batchesInDepartment.filter((b) => b.name.toLowerCase().includes(query));
-  }, [batchesInDepartment, batchSearchQuery]);
 
-  const subjectNameById = useMemo(
-    () => new Map(subjects.map((s) => [s.id, s.name])),
-    [subjects],
-  );
-
-  const selectedSubjectNames = useMemo(
-    () =>
-      formState.subjectIds
-        .map((id) => subjectNameById.get(id))
-        .filter((name): name is string => Boolean(name)),
-    [formState.subjectIds, subjectNameById],
-  );
-
-  const loadBatches = useCallback(async () => {
-    setIsLoadingBatches(true);
-    try {
-      setBatches(await listBatches());
-    } catch (err) {
-      setError(resolveApiErrorMessage(err, "Failed to load batches."));
-    } finally {
-      setIsLoadingBatches(false);
-    }
-  }, []);
-
-  const loadInitial = useCallback(async () => {
-    setIsLoadingDepartments(true);
-    setError(null);
-    try {
-      const [deptResponse, subjectResponse] = await Promise.all([
-        listDepartments(),
-        listSubjects(),
-      ]);
-      setDepartments(deptResponse);
-      setSubjects(subjectResponse);
-
-      const paramId = searchParams.get("departmentId");
-      const parsed = paramId ? Number(paramId) : NaN;
-      const initialId =
-        Number.isInteger(parsed) && parsed > 0 && deptResponse.some((d) => d.id === parsed)
-          ? parsed
-          : deptResponse[0]?.id ?? null;
-      setSelectedDepartmentId(initialId);
-    } catch (err) {
-      setError(resolveApiErrorMessage(err, "Failed to load departments."));
-    } finally {
-      setIsLoadingDepartments(false);
-    }
-  }, [searchParams]);
+    return batchesInDepartment.filter((batch) =>
+      batch.name.toLowerCase().includes(query)
+    );
+  }, [batchSearchQuery, batchesInDepartment]);
 
   useEffect(() => {
-    void loadInitial();
-  }, [loadInitial]);
+    const load = async () => {
+      setIsLoading(true);
 
-  useEffect(() => {
-    void loadBatches();
-  }, [loadBatches]);
+      try {
+        const [
+          departmentResponse,
+          subjectResponse,
+          batchResponse,
+        ] = await Promise.all([
+          listDepartments(),
+          listSubjects(),
+          listBatches(),
+        ]);
 
-  const resetForm = () => {
-    setFormState(initialBatchForm);
+        setDepartments(departmentResponse);
+        setSubjects(subjectResponse);
+        setBatches(batchResponse);
+
+        const parsedParam = Number(
+          departmentParam
+        );
+
+        const initialDepartmentId =
+          Number.isInteger(parsedParam) &&
+          parsedParam > 0 &&
+          departmentResponse.some(
+            (department) =>
+              department.id === parsedParam
+          )
+            ? parsedParam
+            : departmentResponse[0]?.id ?? null;
+
+        setSelectedDepartmentId(
+          initialDepartmentId
+        );
+      } catch (err) {
+        setError(
+          resolveApiErrorMessage(
+            err,
+            "Failed to load batches."
+          )
+        );
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    void load();
+  }, [departmentParam]);
+
+  const resetForm = (
+    clearMessages = true
+  ) => {
     setSelectedBatchId(null);
-    setIsEditing(false);
+
+    setFormState(initialBatchForm);
+
+    if (clearMessages) {
+      setError(null);
+      setSuccessMessage(null);
+    }
   };
 
-  const selectDepartment = (department: Department) => {
+  const selectDepartment = (
+    department: Department
+  ) => {
     setSelectedDepartmentId(department.id);
-    setSearchParams({ departmentId: String(department.id) });
+
+    setSearchParams({
+      departmentId: String(department.id),
+    });
+
     resetForm();
-    setError(null);
-    setSuccessMessage(null);
   };
 
   const selectBatch = (batch: Batch) => {
     setSelectedBatchId(batch.id);
+
     setFormState({
       name: batch.name,
       semester: String(batch.semester),
-      subjectIds: batch.subject_ids,
+      subjectIds: batch.subject_ids ?? [],
     });
-    setIsEditing(true);
+
     setError(null);
     setSuccessMessage(null);
   };
 
-  const validateForm = (): boolean => {
+  const toggleSubject = (subjectId: number) => {
+    setFormState((current) => {
+      const exists =
+        current.subjectIds.includes(subjectId);
+
+      return {
+        ...current,
+        subjectIds: exists
+          ? current.subjectIds.filter(
+              (id) => id !== subjectId
+            )
+          : [...current.subjectIds, subjectId],
+      };
+    });
+  };
+
+  const validateForm = () => {
     if (!formState.name.trim()) {
       setError("Batch name is required.");
       return false;
     }
-    const semester = Number(formState.semester);
-    if (!Number.isInteger(semester) || semester < 1) {
-      setError("Semester must be a positive integer.");
+
+    const semester = Number(
+      formState.semester
+    );
+
+    if (
+      !Number.isInteger(semester) ||
+      semester < 1
+    ) {
+      setError(
+        "Semester must be a positive integer."
+      );
       return false;
     }
+
     if (!selectedDepartmentId) {
-      setError("Select a department first.");
+      setError("Select a department.");
       return false;
     }
+
     return true;
   };
 
-  const handleSubmit = async (event: React.FormEvent) => {
+  const handleSubmit = async (
+    event: React.FormEvent<HTMLFormElement>
+  ) => {
     event.preventDefault();
+
     setError(null);
     setSuccessMessage(null);
-    if (!validateForm() || !selectedDepartmentId) {
+
+    if (
+      !validateForm() ||
+      !selectedDepartmentId
+    ) {
       return;
     }
 
@@ -181,211 +287,406 @@ function BatchesPage() {
     };
 
     setIsSaving(true);
+
     try {
-      if (isEditing && selectedBatchId !== null) {
-        const updated = await updateBatch(selectedBatchId, payload);
-        setBatches((current) => current.map((b) => (b.id === updated.id ? updated : b)));
-        setSuccessMessage("Batch updated successfully.");
+      if (selectedBatchId !== null) {
+        const updatedBatch =
+          await updateBatch(
+            selectedBatchId,
+            payload
+          );
+
+        setBatches((current) =>
+          current.map((batch) =>
+            batch.id === updatedBatch.id
+              ? updatedBatch
+              : batch
+          )
+        );
+
+        setSuccessMessage(
+          "Batch updated successfully."
+        );
       } else {
-        const created = await createBatch(payload);
-        setBatches((current) => [created, ...current]);
-        selectBatch(created);
-        setSuccessMessage("Batch created successfully.");
+        const createdBatch =
+          await createBatch(payload);
+
+        setBatches((current) => [
+          createdBatch,
+          ...current,
+        ]);
+
+        setSuccessMessage(
+          "Batch created successfully."
+        );
       }
+
+      resetForm(false);
     } catch (err) {
-      setError(resolveApiErrorMessage(err, "Failed to save batch."));
+      setError(
+        resolveApiErrorMessage(
+          err,
+          "Failed to save batch."
+        )
+      );
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleDelete = async (batchId: number) => {
-    if (!window.confirm("Delete this batch?")) {
+  const handleDelete = async () => {
+    if (selectedBatchId === null) {
       return;
     }
-    setDeletingBatchId(batchId);
+
+    const confirmed = window.confirm(
+      "Delete this batch?"
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setIsDeleting(true);
+
     setError(null);
+
     try {
-      await deleteBatch(batchId);
-      setBatches((current) => current.filter((b) => b.id !== batchId));
-      setSuccessMessage("Batch deleted.");
-      if (selectedBatchId === batchId) {
-        resetForm();
-      }
+      await deleteBatch(selectedBatchId);
+
+      setBatches((current) =>
+        current.filter(
+          (batch) =>
+            batch.id !== selectedBatchId
+        )
+      );
+
+      setSuccessMessage(
+        "Batch deleted successfully."
+      );
+
+      resetForm(false);
     } catch (err) {
-      setError(resolveApiErrorMessage(err, "Failed to delete batch."));
+      setError(
+        resolveApiErrorMessage(
+          err,
+          "Failed to delete batch."
+        )
+      );
     } finally {
-      setDeletingBatchId(null);
+      setIsDeleting(false);
     }
   };
 
   return (
-    <PageContainer
-      title="Batches"
-      description="Manage student batches and their subjects per department"
-      action={
-        selectedDepartment ? (
-          <Button type="button" className="gap-2" onClick={resetForm}>
+    <div className="min-h-[calc(100vh-5rem)] p-6">
+      <div className="mx-auto space-y-6">
+
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold">
+              Batches
+            </h1>
+
+            <p className="mt-1 text-sm text-gray-500">
+              Create and manage batches
+            </p>
+          </div>
+
+          <button
+            onClick={() => resetForm()}
+            className="flex items-center gap-2  bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
+          >
             <Plus className="h-4 w-4" />
-            New Batch
-          </Button>
-        ) : null
-      }
-    >
-      <StatusAlerts error={error} successMessage={successMessage} />
 
-      {departments.length === 0 && !isLoadingDepartments ? (
-        <Card>
-          <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            Create a department first on the{" "}
-            <Link to="/departments" className="text-primary underline">
-              Departments
-            </Link>{" "}
-            page.
-          </CardContent>
-        </Card>
-      ) : (
-        <div className="grid gap-6 xl:grid-cols-12">
-          <div className="xl:col-span-3">
-            <DepartmentPicker
-              departments={departments}
-              selectedDepartmentId={selectedDepartmentId}
-              isLoading={isLoadingDepartments}
-              onSelect={selectDepartment}
-            />
-          </div>
-
-          <div className="xl:col-span-9">
-            {selectedDepartment ? (
-              <div className="grid gap-6 xl:grid-cols-12">
-                <Card className="xl:col-span-5">
-                  <CardHeader>
-                    <CardTitle className="text-lg">Batches</CardTitle>
-                    <p className="text-sm text-muted-foreground">{selectedDepartment.name}</p>
-                  </CardHeader>
-                  <CardContent className="space-y-3">
-                    <Input
-                      placeholder="Search batches..."
-                      value={batchSearchQuery}
-                      onChange={(e) => setBatchSearchQuery(e.target.value)}
-                    />
-                    {isLoadingBatches ? (
-                      <p className="text-sm text-muted-foreground">Loading batches...</p>
-                    ) : filteredBatches.length === 0 ? (
-                      <p className="text-sm text-muted-foreground">No batches in this department.</p>
-                    ) : (
-                      filteredBatches.map((batch) => (
-                        <div
-                          key={batch.id}
-                          className={`flex justify-between gap-2 rounded-lg border p-3 cursor-pointer ${
-                            selectedBatchId === batch.id
-                              ? "border-primary bg-primary/10"
-                              : "border-border hover:bg-accent/50"
-                          }`}
-                          onClick={() => selectBatch(batch)}
-                        >
-                          <div>
-                            <p className="font-medium">{batch.name}</p>
-                            <p className="text-xs text-muted-foreground">Semester {batch.semester}</p>
-                          </div>
-                          <Button
-                            variant="destructive"
-                            size="sm"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void handleDelete(batch.id);
-                            }}
-                            disabled={deletingBatchId !== null}
-                          >
-                            {deletingBatchId === batch.id ? "..." : "Delete"}
-                          </Button>
-                        </div>
-                      ))
-                    )}
-                  </CardContent>
-                </Card>
-
-                <Card className="xl:col-span-7 xl:sticky xl:top-[6rem]">
-                  <CardHeader>
-                    <CardTitle>{isEditing ? "Edit Batch" : "Add Batch"}</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <form className="space-y-4" onSubmit={handleSubmit}>
-                      <div className="space-y-2">
-                        <label className="text-sm font-medium">Batch name</label>
-                        <Input
-                          value={formState.name}
-                          onChange={(e) => setFormState((c) => ({ ...c, name: e.target.value }))}
-                          required
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <label className="text-sm font-medium">Semester</label>
-                        <Input
-                          type="number"
-                          min={1}
-                          value={formState.semester}
-                          onChange={(e) =>
-                            setFormState((c) => ({ ...c, semester: e.target.value }))
-                          }
-                          required
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <label className="text-sm font-medium">Subjects</label>
-                        <select
-                          multiple
-                          className="h-32 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                          value={formState.subjectIds.map(String)}
-                          onChange={(e) => {
-                            const selected = Array.from(e.target.selectedOptions).map((o) =>
-                              Number(o.value),
-                            );
-                            setFormState((c) => ({ ...c, subjectIds: selected }));
-                          }}
-                        >
-                          {subjects.map((subject) => (
-                            <option key={subject.id} value={subject.id}>
-                              {subject.name}
-                            </option>
-                          ))}
-                        </select>
-                        {selectedSubjectNames.length > 0 ? (
-                          <div className="flex flex-wrap gap-1">
-                            {selectedSubjectNames.map((name) => (
-                              <span
-                                key={name}
-                                className="rounded-full bg-primary/10 px-2 py-1 text-xs text-primary"
-                              >
-                                {name}
-                              </span>
-                            ))}
-                          </div>
-                        ) : null}
-                      </div>
-                      <Input value={selectedDepartment.name} readOnly aria-label="Department" />
-                      <div className="flex gap-2">
-                        <Button type="submit" disabled={isSaving} className="flex-1">
-                          {isSaving ? "Saving..." : isEditing ? "Update" : "Add"}
-                        </Button>
-                        {isEditing ? (
-                          <Button type="button" variant="outline" onClick={resetForm}>
-                            Cancel
-                          </Button>
-                        ) : null}
-                      </div>
-                    </form>
-                  </CardContent>
-                </Card>
-              </div>
-            ) : (
-              <p className="text-muted-foreground">Select a department to manage batches.</p>
-            )}
-          </div>
+            <span>New Batch</span>
+          </button>
         </div>
-      )}
-    </PageContainer>
+
+        {/* Alerts */}
+        {error && (
+          <div className="flex items-start gap-3  border border-red-200 bg-red-50 p-4 text-red-700">
+            <AlertCircle className="mt-0.5 h-5 w-5 shrink-0" />
+
+            <p>{error}</p>
+          </div>
+        )}
+
+        {successMessage && (
+          <div className="flex items-start gap-3  border border-green-200 bg-green-50 p-4 text-green-700">
+            <CheckCircle className="mt-0.5 h-5 w-5 shrink-0" />
+
+            <p>{successMessage}</p>
+          </div>
+        )}
+
+        {/* Main Layout */}
+        <div className="grid gap-6 lg:grid-cols-12">
+
+          {/* Departments */}
+          <div className="lg:col-span-3">
+            <div className=" border shadow-sm">
+
+              <div className="border-b p-4">
+                <h2 className="text-lg font-semibold">
+                  Departments
+                </h2>
+              </div>
+
+              <div className="p-2">
+                {isLoading ? (
+                  <div className="p-4 text-sm text-gray-500">
+                    Loading...
+                  </div>
+                ) : (
+                  departments.map((department) => (
+                    <button
+                      key={department.id}
+                      onClick={() =>
+                        selectDepartment(
+                          department
+                        )
+                      }
+                      className={`w-full  px-4 py-3 text-left transition border my-2   ${
+                        selectedDepartmentId ===
+                        department.id
+                          ? "bg-blue-100 font-semibold text-blue-700"
+                          : "hover:bg-gray-100"
+                      }`}
+                    >
+                      {department.name}
+                    </button>
+                  ))
+                )}
+              </div>
+
+            </div>
+          </div>
+
+          {/* Batch List */}
+          <div className="lg:col-span-4">
+            <div className=" border bg-white/10 shadow-sm">
+
+              <div className="border-b p-4">
+                <h2 className="text-lg font-semibold">
+                  {selectedDepartment
+                    ? `${selectedDepartment.name} Batches`
+                    : "Batches"}
+                </h2>
+              </div>
+
+              <div className="border-b p-4">
+                <input
+                  type="text"
+                  placeholder="Search batches..."
+                  value={batchSearchQuery}
+                  onChange={(e) =>
+                    setBatchSearchQuery(
+                      e.target.value
+                    )
+                  }
+                  className="w-full  border border-gray-600 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div className="max-h-140 overflow-y-auto p-3">
+                {isLoading ? (
+                  <div className="py-10 text-center text-sm text-gray-500">
+                    Loading batches...
+                  </div>
+                ) : filteredBatches.length ===
+                  0 ? (
+                  <div className="py-10 text-center text-sm text-gray-500">
+                    No batches found.
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+
+                    {filteredBatches.map((batch) => (
+                      <button
+                        key={batch.id}
+                        onClick={() =>
+                          selectBatch(batch)
+                        }
+                        className={`w-full  border p-4 text-left transition ${
+                          selectedBatchId ===
+                          batch.id
+                            ? "border-blue-500 bg-blue-50"
+                            : "border-gray-500 hover:border-blue-300 hover:bg-gray-50"
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+
+                          <div>
+                            <div className="font-semibold">
+                              {batch.name} 
+                            </div>
+
+                            <div className="mt-1 text-xs text-gray-500">
+                              Semester:{" "}
+                              {batch.semester}
+                            </div>
+                          </div>
+
+                        </div>
+                      </button>
+                    ))}
+
+                  </div>
+                )}
+              </div>
+
+            </div>
+          </div>
+
+          {/* Form */}
+          <div className="lg:col-span-5">
+            <div className=" border bg-white/10 shadow-sm">
+
+              <div className="border-b p-6">
+                <h2 className="text-2xl font-semibold">
+                  {selectedBatch
+                    ? `Edit ${selectedBatch.name} sem ${selectedBatch.semester}`
+                    : "Create Batch"}
+                </h2>
+              </div>
+
+              <form
+                onSubmit={handleSubmit}
+                className="space-y-6 p-6"
+              >
+
+                {/* Name */}
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">
+                    Batch Name
+                  </label>
+
+                  <input
+                    type="text"
+                    value={formState.name}
+                    onChange={(e) =>
+                      setFormState(
+                        (current) => ({
+                          ...current,
+                          name: e.target.value,
+                        })
+                      )
+                    }
+                    placeholder="e.g. CSE-A"
+                    className="w-full  border border-gray-600 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                  />
+                </div>
+
+                {/* Semester */}
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">
+                    Semester
+                  </label>
+
+                  <input
+                    type="number"
+                    min={1}
+                    value={formState.semester}
+                    onChange={(e) =>
+                      setFormState(
+                        (current) => ({
+                          ...current,
+                          semester:
+                            e.target.value,
+                        })
+                      )
+                    }
+                    placeholder="e.g. 5"
+                    className="w-full  border border-gray-600 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                  />
+                </div>
+
+                {/* Subjects */}
+                <div className="space-y-3">
+                  <label className="text-sm font-medium">
+                    Subjects {subjects.length}
+                  </label>
+
+                  <div className="max-h-56 bg-white/80 space-y-2 overflow-y-auto  border p-4">
+
+                    {subjects.length ===
+                    0 ? (
+                      <div className="text-sm text-gray-500">
+                        No subjects available.
+                      </div>
+                    ) : (
+                      subjects.map(
+                        (subject) => (
+                          <label
+                            key={subject.id}
+                            className="flex items-center gap-3  border border-gray-500 p-3 hover:bg-gray-50"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={formState.subjectIds.includes(
+                                subject.id
+                              )}
+                              onChange={() =>
+                                toggleSubject(
+                                  subject.id
+                                )
+                              }
+                            />
+
+                            <span className="text-sm">
+                              {subject.name}
+                            </span>
+                          </label>
+                        )
+                      )
+                    )}
+
+                  </div>
+                </div>
+
+                {/* Buttons */}
+                <div className="flex gap-4">
+
+                  <button
+                    type="submit"
+                    disabled={isSaving}
+                    className="flex-1  bg-blue-600 px-4 py-3 font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {isSaving
+                      ? "Saving..."
+                      : selectedBatch
+                      ? "Update Batch"
+                      : "Create Batch"}
+                  </button>
+
+                  {selectedBatch && (
+                    <button
+                      type="button"
+                      onClick={handleDelete}
+                      disabled={isDeleting}
+                      className="flex items-center justify-center gap-2  bg-red-600 px-4 py-3 font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                    >
+                      <Trash2 className="h-4 w-4" />
+
+                      {isDeleting
+                        ? "Deleting..."
+                        : "Delete"}
+                    </button>
+                  )}
+
+                </div>
+
+              </form>
+
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
   );
 }
 
-export default BatchesPage;
+export default Batches;

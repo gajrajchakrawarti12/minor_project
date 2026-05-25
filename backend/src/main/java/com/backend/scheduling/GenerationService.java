@@ -1187,11 +1187,6 @@ public class GenerationService {
         }
     }
 
-    private boolean isUsed(Map<Long, BitSet> usedMap, Long entityId, int slotIndex) {
-        BitSet bitSet = usedMap.get(entityId);
-        return bitSet != null && bitSet.get(slotIndex);
-    }
-
     private void cleanupBitSet(Map<Long, BitSet> map, Long key) {
         BitSet bitSet = map.get(key);
         if (bitSet != null && bitSet.isEmpty()) {
@@ -1534,21 +1529,6 @@ public class GenerationService {
         return ordered;
     }
 
-    private void bindNonPracticalRoom(Long batchId, Long roomId, SchedulingState state) {
-        state.nonPracticalRoomByBatch.putIfAbsent(batchId, roomId);
-        state.nonPracticalRoomUsageCountByBatch.merge(batchId, 1, Integer::sum);
-    }
-
-    private void unbindNonPracticalRoom(Long batchId, SchedulingState state) {
-        int updated = state.nonPracticalRoomUsageCountByBatch.getOrDefault(batchId, 0) - 1;
-        if (updated <= 0) {
-            state.nonPracticalRoomUsageCountByBatch.remove(batchId);
-            state.nonPracticalRoomByBatch.remove(batchId);
-            return;
-        }
-        state.nonPracticalRoomUsageCountByBatch.put(batchId, updated);
-    }
-
     private void bindSubjectTeacher(Long batchId, Long subjectId, Long teacherId, SchedulingState state) {
         long key = subjectMaskKey(batchId, subjectId);
         state.subjectTeacherByBatchSubject.putIfAbsent(key, teacherId);
@@ -1642,26 +1622,6 @@ public class GenerationService {
 
             state.teacherLoad.merge(teacherId, 1, Integer::sum);
             state.roomLoad.merge(roomId, 1, Integer::sum);
-        }
-    }
-
-    private void validateGeneratedUniqueness(List<TimetableEntity> generated) {
-        HashSet<SlotPair> batchSlot = new HashSet<>();
-        HashSet<SlotPair> teacherSlot = new HashSet<>();
-        HashSet<SlotPair> roomSlot = new HashSet<>();
-
-        for (TimetableEntity row : generated) {
-            Long slotId = row.getTimeSlot().getId();
-
-            if (!batchSlot.add(new SlotPair(row.getBatch().getId(), slotId))) {
-                throw new InvalidRequestException("Generated timetable contains duplicate batch-slot assignment");
-            }
-            if (!teacherSlot.add(new SlotPair(row.getTeacher().getId(), slotId))) {
-                throw new InvalidRequestException("Generated timetable contains duplicate teacher-slot assignment");
-            }
-            if (!roomSlot.add(new SlotPair(row.getRoom().getId(), slotId))) {
-                throw new InvalidRequestException("Generated timetable contains duplicate room-slot assignment");
-            }
         }
     }
 
