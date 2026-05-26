@@ -35,7 +35,7 @@ public class SecurityConfig {
         return http
                 .csrf(customizer -> customizer.disable())
                 .authorizeHttpRequests(auth -> auth
-                    .requestMatchers("/api/auth/signup", "/api/auth/login", "/api/auth/logout", "/error")
+                        .requestMatchers("/api/auth/signup", "/api/auth/login", "/api/auth/logout", "/error")
                         .permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/timetables/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/teachers/**").permitAll()
@@ -47,10 +47,23 @@ public class SecurityConfig {
                 .sessionManagement(customizer -> customizer.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .cors(customizer -> customizer.configurationSource(request -> {
                     var cors = new CorsConfiguration();
-                    cors.setAllowedOrigins(Arrays.asList("http://localhost:5173", "https://minor-project-steel.vercel.app"));
-                    cors.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
-                    cors.setAllowedHeaders(Arrays.asList("*"));
+
+                    cors.setAllowedOrigins(Arrays.asList(
+                            "http://localhost:5173",
+                            "https://minor-project-steel.vercel.app"));
+
+                    cors.setAllowedMethods(Arrays.asList(
+                            "GET", "POST", "PUT", "DELETE", "OPTIONS"));
+
+                    cors.setAllowedHeaders(Arrays.asList(
+                            "Content-Type",
+                            "Authorization"));
+
                     cors.setAllowCredentials(true);
+
+                    cors.setExposedHeaders(Arrays.asList(
+                            "Set-Cookie"));
+
                     return cors;
                 }))
                 .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)
@@ -58,7 +71,8 @@ public class SecurityConfig {
     }
 
     @Bean
-    public AuthenticationProvider authenticationProvider(UserDetailsService userDetailsService, PasswordEncoder passwordEncoder) {
+    public AuthenticationProvider authenticationProvider(UserDetailsService userDetailsService,
+            PasswordEncoder passwordEncoder) {
         DaoAuthenticationProvider authProvider = new DaoAuthenticationProvider(userDetailsService);
         authProvider.setPasswordEncoder(passwordEncoder);
         return authProvider;

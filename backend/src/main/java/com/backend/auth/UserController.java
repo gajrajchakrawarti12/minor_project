@@ -27,10 +27,10 @@ public class UserController {
     @Value("${app.auth.cookie.name:token}")
     private String authCookieName;
 
-    @Value("${app.auth.cookie.secure:false}")
+    @Value("${app.auth.cookie.secure:true}")
     private boolean forceSecureCookie;
 
-    @Value("${app.auth.cookie.same-site:Lax}")
+    @Value("${app.auth.cookie.same-site:None}")
     private String sameSite;
 
     @Value("${app.auth.jwt-expiration-ms:900000}")
