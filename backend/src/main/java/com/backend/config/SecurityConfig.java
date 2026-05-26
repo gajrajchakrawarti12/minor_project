@@ -47,7 +47,7 @@ public class SecurityConfig {
                 .sessionManagement(customizer -> customizer.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .cors(customizer -> customizer.configurationSource(request -> {
                     var cors = new CorsConfiguration();
-                    cors.setAllowedOrigins(Arrays.asList("http://localhost:5173"));
+                    cors.setAllowedOrigins(Arrays.asList("http://localhost:5173", "https://minor-project-steel.vercel.app"));
                     cors.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
                     cors.setAllowedHeaders(Arrays.asList("*"));
                     cors.setAllowCredentials(true);
